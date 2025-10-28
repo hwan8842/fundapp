@@ -3,7 +3,7 @@ import streamlit.components.v1 as components
 import sqlite3
 import pandas as pd
 from datetime import datetime, date, timedelta
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 import json, math, time
 import numpy as np
 import altair as alt
@@ -142,7 +142,9 @@ def init_db():
             amount REAL NOT NULL,
             note TEXT,
             source TEXT DEFAULT 'MANUAL',
-            FOREIGN KEY(investor_id) REFERENCES investors(id) ON DELETE CASCADE
+            dividend_id INTEGER,
+            FOREIGN KEY(investor_id) REFERENCES investors(id) ON DELETE CASCADE,
+            FOREIGN KEY(dividend_id) REFERENCES dividends(id) ON DELETE SET NULL
         );
         CREATE TABLE IF NOT EXISTS trades(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -193,6 +195,7 @@ def init_db():
         """)
         for alter in [
             "ALTER TABLE cash_flows ADD COLUMN source TEXT DEFAULT 'MANUAL'",
+            "ALTER TABLE cash_flows ADD COLUMN dividend_id INTEGER",
             "ALTER TABLE dividends ADD COLUMN record_dt TEXT",
             "ALTER TABLE investor_trades ADD COLUMN is_edit INTEGER NOT NULL DEFAULT 0",
         ]:
@@ -204,6 +207,7 @@ def init_db():
         CREATE INDEX IF NOT EXISTS ix_invtrades_trade ON investor_trades(trade_id);
         CREATE INDEX IF NOT EXISTS ix_cash_dt_ccy ON cash_flows(dt, ccy);
         CREATE INDEX IF NOT EXISTS ix_cash_investor_ccy ON cash_flows(investor_id, ccy);
+        CREATE INDEX IF NOT EXISTS ix_cash_dividend ON cash_flows(dividend_id);
         CREATE INDEX IF NOT EXISTS ix_rp_trade_investor ON realized_pnl(trade_id, investor_id);
         """)
         conn.commit()
@@ -514,7 +518,7 @@ def rebuild_trade_effects(from_dt: Optional[str] = None):
                     ins_rp
                 )
 
-    prefee_map_all.clear(); investor_positions.clear(); investor_balances.clear(); load_df.clear()
+    invalidate_all_caches()
 
 # ==============================
 # Aggregations (Cached)
@@ -595,6 +599,214 @@ def prefee_map_all() -> Dict[Tuple[int,int], float]:
                 if qty_pos < 1e-12: qty_pos, avg_cost = 0.0, 0.0
     return out
 
+
+def invalidate_all_caches() -> None:
+    """Invalidate frequently reused cached computations."""
+    for fn in (prefee_map_all, investor_positions, investor_balances, load_df):
+        try:
+            fn.clear()
+        except Exception:
+            pass
+
+
+def build_dividend_cashflows(
+    dividend_id: int,
+    deal_dt: date,
+    symbol: str,
+    ccy: str,
+    total_amt: float,
+    memo: str,
+    pos_rec: pd.DataFrame,
+    op_id: Optional[int],
+) -> List[Tuple[int, str, str, str, float, str, str, int]]:
+    if pos_rec.empty:
+        return []
+
+    total_qty = float(pos_rec["pos_qty"].sum())
+    if total_qty <= 0:
+        return []
+
+    expected_total = truncate_amount(total_amt, ccy)
+    rows: List[Dict[str, Any]] = []
+    deposit_sum = 0.0
+    fee_total = 0.0
+
+    for rec in pos_rec.itertuples(index=False):
+        iid = int(rec.investor_id)
+        qty_share = float(rec.pos_qty)
+        if qty_share <= 0:
+            continue
+
+        share = truncate_amount(total_amt * (qty_share / total_qty), ccy)
+        if share != 0:
+            rows.append(
+                {
+                    "investor_id": iid,
+                    "type": "DIVIDEND",
+                    "amount": share,
+                    "note": memo,
+                }
+            )
+            deposit_sum += share
+
+        fee = truncate_amount(0.10 * share, ccy)
+        if fee > 0:
+            rows.append(
+                {
+                    "investor_id": iid,
+                    "type": "MGMT_FEE_OUT",
+                    "amount": fee,
+                    "note": f"배당 성과수수료 {symbol}",
+                }
+            )
+            fee_total += fee
+
+    if op_id and fee_total > 0:
+        rows.append(
+            {
+                "investor_id": op_id,
+                "type": "MGMT_FEE_IN",
+                "amount": truncate_amount(fee_total, ccy),
+                "note": f"배당 성과수수료 합계 {symbol}",
+            }
+        )
+
+    round_diff = truncate_amount(expected_total - deposit_sum, ccy)
+    if op_id and abs(round_diff) > 1e-8:
+        if round_diff > 0:
+            rows.append(
+                {
+                    "investor_id": op_id,
+                    "type": "DIVIDEND_ROUND_ADJ",
+                    "amount": truncate_amount(round_diff, ccy),
+                    "note": f"배당 반올림 조정 {symbol}",
+                }
+            )
+        else:
+            diff = -round_diff
+            fee_idx = next(
+                (
+                    idx
+                    for idx, item in enumerate(rows)
+                    if item["investor_id"] == op_id and item["type"] == "MGMT_FEE_IN"
+                ),
+                None,
+            )
+            if fee_idx is not None:
+                reducible = min(diff, rows[fee_idx]["amount"])
+                new_amt = truncate_amount(rows[fee_idx]["amount"] - reducible, ccy)
+                diff -= reducible
+                if new_amt <= 1e-12:
+                    rows.pop(fee_idx)
+                else:
+                    rows[fee_idx]["amount"] = new_amt
+            if diff > 1e-8:
+                rows.append(
+                    {
+                        "investor_id": op_id,
+                        "type": "DIVIDEND_ROUND_ADJ",
+                        "amount": truncate_amount(-diff, ccy),
+                        "note": f"배당 반올림 조정 {symbol}",
+                    }
+                )
+
+    out_rows = [
+        (
+            row["investor_id"],
+            deal_dt.isoformat(),
+            ccy,
+            row["type"],
+            row["amount"],
+            row["note"],
+            "DIVIDEND",
+            dividend_id,
+        )
+        for row in rows
+        if abs(row["amount"]) > 1e-12
+    ]
+    return out_rows
+
+
+def summarize_dividend_history(div_meta: pd.DataFrame, cf_recent: pd.DataFrame) -> pd.DataFrame:
+    if div_meta.empty or cf_recent.empty:
+        return pd.DataFrame()
+
+    cf_recent = cf_recent.copy()
+    cf_recent["note"] = cf_recent["note"].fillna("")
+    records: List[Dict[str, Any]] = []
+
+    for div in div_meta.itertuples(index=False):
+        div_rows = cf_recent[cf_recent["dividend_id"] == div.id]
+
+        if div_rows.empty:
+            base_mask = (
+                (cf_recent["dividend_id"].isna())
+                & (cf_recent["dt"] == div.dt)
+                & (cf_recent["통화"] == div.ccy)
+            )
+            candidate_rows = cf_recent[base_mask]
+
+            if div.note:
+                note_mask = (candidate_rows["type"] == "DIVIDEND") & (candidate_rows["note"] == div.note)
+            else:
+                note_mask = candidate_rows["type"] == "DIVIDEND"
+
+            if div.symbol:
+                extra_mask = candidate_rows["note"].str.contains(div.symbol, regex=False)
+            else:
+                extra_mask = pd.Series(False, index=candidate_rows.index)
+
+            div_rows = candidate_rows[note_mask | extra_mask]
+
+        if div_rows.empty:
+            continue
+
+        for iid, grp in div_rows.groupby("investor_id"):
+            investor_name = grp["투자자"].iloc[0]
+            base_amt = truncate_amount(
+                float(grp.loc[grp["type"] == "DIVIDEND", "amount"].sum()),
+                div.ccy,
+            )
+            fee_out = truncate_amount(
+                float(grp.loc[grp["type"] == "MGMT_FEE_OUT", "amount"].sum()),
+                div.ccy,
+            )
+            fee_in = truncate_amount(
+                float(grp.loc[grp["type"] == "MGMT_FEE_IN", "amount"].sum()),
+                div.ccy,
+            )
+            round_adj = truncate_amount(
+                float(grp.loc[grp["type"] == "DIVIDEND_ROUND_ADJ", "amount"].sum()),
+                div.ccy,
+            )
+
+            if investor_name == OPERATOR_NAME:
+                net_amt = truncate_amount(base_amt - fee_out + fee_in - round_adj, div.ccy)
+            else:
+                net_amt = truncate_amount(base_amt - fee_out, div.ccy)
+
+            records.append(
+                {
+                    "일자": div.dt,
+                    "종목": div.symbol,
+                    "투자자": investor_name,
+                    "통화": div.ccy,
+                    "원배당금액": base_amt if base_amt != 0 else 0.0,
+                    "운용자수수료": fee_out if fee_out != 0 else 0.0,
+                    "운용수수료총액": fee_in if fee_in != 0 else 0.0,
+                    "반올림조정": round_adj if round_adj != 0 else 0.0,
+                    "순지급금액": net_amt,
+                    "비고": div.note or "",
+                }
+            )
+
+    if not records:
+        return pd.DataFrame()
+
+    out_df = pd.DataFrame(records)
+    out_df.sort_values(["일자", "종목", "투자자"], ascending=[False, True, True], inplace=True)
+    return out_df
+
 # ==============================
 # App Boot
 # ==============================
@@ -660,7 +872,7 @@ with T2:
         if ok:
             iid = get_investor_id_by_name(sel_name)
             add_cashflow_retry(iid, dt_cf, sel_ccy, io_type, amt, note if 'note' in locals() else "", source="MANUAL")
-            prefee_map_all.clear(); investor_positions.clear(); investor_balances.clear(); load_df.clear()
+            invalidate_all_caches()
             st.success("기록 완료"); _rr()
 
     st.markdown("### 최근입출금")
@@ -735,7 +947,7 @@ with T2:
                             cur.execute("UPDATE cash_flows SET dt=?, ccy=?, type=?, amount=?, note=? WHERE id=?",
                                         (row["dt"], row["ccy"], row["type"], float(row["amount"]), row["note"], int(rid)))
                         conn.commit()
-                    prefee_map_all.clear(); investor_positions.clear(); investor_balances.clear(); load_df.clear()
+                    invalidate_all_caches()
                     st.success(f"{len(changed_ids)}건 저장 완료"); _rr()
                 else:
                     st.info("변경사항이 없습니다.")
@@ -1047,7 +1259,7 @@ with T3:
 
                 if (updated_it > 0) or (updated_trades > 0):
                     rebuild_trade_effects(from_dt=None)
-                prefee_map_all.clear(); investor_positions.clear(); investor_balances.clear(); load_df.clear()
+                invalidate_all_caches()
                 st.success(f"거래 {updated_trades}건 날짜 변경, 원장 {updated_it}건 저장 완료"); _rr()
         with c2:
             if st.button("새로고침", key="it_recent_like_reload"): _rr()
@@ -1161,7 +1373,6 @@ with T5:
                 if pos_rec.empty:
                     st.warning("배당락일 기준 보유자가 없습니다.")
                 else:
-                    total_qty = float(pos_rec["pos_qty"].sum())
                     op_id = get_investor_id_by_name(OPERATOR_NAME)
                     memo = note_div if 'note_div' in locals() and note_div else f"배당 {symbol_div} (배당락일 {record_dt.isoformat()})"
 
@@ -1169,34 +1380,27 @@ with T5:
                         cur = conn.cursor()
                         cur.execute(
                             "INSERT INTO dividends(dt, symbol, ccy, total_amount, note, record_dt) VALUES (?,?,?,?,?,?)",
-                            (deal_dt.isoformat(), symbol_div, ccy_div, truncate_amount(total_amt, ccy_div), memo,
-                             record_dt.isoformat())
+                            (
+                                deal_dt.isoformat(),
+                                symbol_div,
+                                ccy_div,
+                                truncate_amount(total_amt, ccy_div),
+                                memo,
+                                record_dt.isoformat(),
+                            ),
                         )
 
-                        rows_cf = []
-                        fee_total = 0.0
-
-                        # 각자 몫 = 1.0×입금, 동시에 0.1×수수료 OUT → 순증액 0.9
-                        for _, row in pos_rec.iterrows():
-                            iid = int(row["investor_id"])
-                            share = truncate_amount(total_amt * (float(row["pos_qty"]) / total_qty), ccy_div)
-
-                            dep = truncate_amount(1.00 * share, ccy_div)  # <-- 1.0로 입금 (핵심 수정)
-                            fee = truncate_amount(0.10 * share, ccy_div)  # 개인별 수수료
-
-                            if dep != 0:
-                                rows_cf.append((iid, deal_dt.isoformat(), ccy_div, "DIVIDEND", dep, memo, "DIVIDEND"))
-                            if fee > 0:
-                                rows_cf.append(
-                                    (iid, deal_dt.isoformat(), ccy_div, "MGMT_FEE_OUT", fee, f"배당 성과수수료 {symbol_div}",
-                                     "DIVIDEND"))
-                                fee_total += fee
-
-                        # 운용자: 개인 OUT 합계만큼 1회 IN
-                        if op_id and fee_total > 0:
-                            rows_cf.append((op_id, deal_dt.isoformat(), ccy_div, "MGMT_FEE_IN",
-                                            truncate_amount(fee_total, ccy_div),
-                                            f"배당 성과수수료 합계 {symbol_div}", "DIVIDEND"))
+                        dividend_id = cur.lastrowid
+                        rows_cf = build_dividend_cashflows(
+                            dividend_id=dividend_id,
+                            deal_dt=deal_dt,
+                            symbol=symbol_div,
+                            ccy=ccy_div,
+                            total_amt=total_amt,
+                            memo=memo,
+                            pos_rec=pos_rec,
+                            op_id=op_id,
+                        )
 
                         if rows_cf:
                             expected_total = truncate_amount(total_amt, ccy_div)
@@ -1244,16 +1448,17 @@ with T5:
                                         )
 
                             cur.executemany(
-                                "INSERT INTO cash_flows(investor_id, dt, ccy, type, amount, note, source) VALUES (?,?,?,?,?,?,?)",
-                                rows_cf
+                                """
+                                INSERT INTO cash_flows(
+                                    investor_id, dt, ccy, type, amount, note, source, dividend_id
+                                ) VALUES (?,?,?,?,?,?,?,?)
+                                """,
+                                rows_cf,
                             )
                         conn.commit()
 
-                    prefee_map_all.clear();
-                    investor_positions.clear();
-                    investor_balances.clear();
-                    load_df.clear()
-                    st.success("배당 분배 완료");
+                    invalidate_all_caches()
+                    st.success("배당 분배 완료")
                     _rr()
                 # --- 교체 끝 ---
 
@@ -1278,7 +1483,7 @@ with T5:
             cf_recent = load_df(
                 """
                 SELECT cf.investor_id, inv.name AS 투자자, cf.dt, cf.ccy AS 통화,
-                       cf.type, cf.amount, cf.note
+                       cf.type, cf.amount, cf.note, cf.dividend_id
                 FROM cash_flows cf
                 JOIN investors inv ON inv.id = cf.investor_id
                 WHERE cf.source='DIVIDEND' AND date(cf.dt) >= date(?)
@@ -1289,7 +1494,7 @@ with T5:
             cf_recent = load_df(
                 """
                 SELECT cf.investor_id, inv.name AS 투자자, cf.dt, cf.ccy AS 통화,
-                       cf.type, cf.amount, cf.note
+                       cf.type, cf.amount, cf.note, cf.dividend_id
                 FROM cash_flows cf
                 JOIN investors inv ON inv.id = cf.investor_id
                 WHERE cf.source='DIVIDEND'
@@ -1299,93 +1504,24 @@ with T5:
         if cf_recent.empty:
             st.info("최근 배당 분배 내역이 없습니다.")
         else:
-            records: List[Dict[str, object]] = []
-            cf_recent["note"] = cf_recent["note"].fillna("")
-
-            for div_row in div_meta.itertuples(index=False):
-                div_dt = str(div_row.dt)
-                div_ccy = div_row.ccy
-                div_note = div_row.note or ""
-                symbol = div_row.symbol or ""
-
-                base_mask = (
-                    (cf_recent["dt"] == div_dt)
-                    & (cf_recent["통화"] == div_ccy)
-                    & (cf_recent["type"] == "DIVIDEND")
-                    & (cf_recent["note"] == div_note)
-                )
-                if symbol:
-                    extra_mask = (
-                        (cf_recent["dt"] == div_dt)
-                        & (cf_recent["통화"] == div_ccy)
-                        & (cf_recent["type"] != "DIVIDEND")
-                        & cf_recent["note"].str.contains(symbol, regex=False)
-                    )
-                else:
-                    extra_mask = pd.Series(False, index=cf_recent.index)
-
-                event_rows = pd.concat(
-                    [cf_recent.loc[base_mask], cf_recent.loc[extra_mask]], ignore_index=True
-                )
-
-                if event_rows.empty:
-                    continue
-
-                for iid, grp in event_rows.groupby("investor_id"):
-                    investor_name = grp["투자자"].iloc[0]
-                    base_amt = float(grp.loc[grp["type"] == "DIVIDEND", "amount"].sum())
-                    fee_out = float(grp.loc[grp["type"] == "MGMT_FEE_OUT", "amount"].sum())
-                    fee_in = float(grp.loc[grp["type"] == "MGMT_FEE_IN", "amount"].sum())
-                    round_adj = float(
-                        grp.loc[grp["type"] == "DIVIDEND_ROUND_ADJ", "amount"].sum()
-                    )
-
-                    base_amt = truncate_amount(base_amt, div_ccy)
-                    fee_out = truncate_amount(fee_out, div_ccy)
-                    fee_in = truncate_amount(fee_in, div_ccy)
-                    round_adj = truncate_amount(round_adj, div_ccy)
-
-                    if investor_name == OPERATOR_NAME:
-                        net_amt = truncate_amount(
-                            base_amt - fee_out + fee_in - round_adj, div_ccy
-                        )
-                    else:
-                        net_amt = truncate_amount(base_amt - fee_out, div_ccy)
-
-                    records.append(
-                        {
-                            "일자": div_dt,
-                            "종목": symbol,
-                            "투자자": investor_name,
-                            "통화": div_ccy,
-                            "원배당금액": base_amt if base_amt != 0 else 0.0,
-                            "운용자수수료": fee_out if fee_out != 0 else 0.0,
-                            "운용수수료총액": fee_in if fee_in != 0 else 0.0,
-                            "반올림조정": round_adj if round_adj != 0 else 0.0,
-                            "순지급금액": net_amt,
-                            "비고": div_note,
-                        }
-                    )
-
-            if not records:
+            div_summary = summarize_dividend_history(div_meta, cf_recent)
+            if div_summary.empty:
                 st.info("최근 배당 분배 내역이 없습니다.")
             else:
-                div_recent = pd.DataFrame(records)
-                div_recent.sort_values(["일자", "종목", "투자자"], ascending=[False, True, True], inplace=True)
-                div_recent_fmt = apply_row_ccy_format(
-                    div_recent.copy(),
+                div_summary_fmt = apply_row_ccy_format(
+                    div_summary.copy(),
                     "통화",
                     [],
                     [],
                     ["원배당금액", "운용자수수료", "운용수수료총액", "반올림조정", "순지급금액"],
                 )
                 try:
-                    div_recent_fmt["일자"] = pd.to_datetime(
-                        div_recent_fmt["일자"], errors="coerce"
+                    div_summary_fmt["일자"] = pd.to_datetime(
+                        div_summary_fmt["일자"], errors="coerce"
                     ).dt.date
                 except Exception:
                     pass
-                st.dataframe(div_recent_fmt, use_container_width=True)
+                st.dataframe(div_summary_fmt, use_container_width=True)
 
 # ==============================
 # Sell Notice
@@ -1548,10 +1684,33 @@ def delete_dividends(ids: List[int]) -> int:
     if not ids: return 0
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute(f"DELETE FROM dividends WHERE id IN ({','.join('?'*len(ids))})", ids)
-        # 배당 삭제 → 배당 유래 현금흐름 제거
-        cur.execute("DELETE FROM cash_flows WHERE source='DIVIDEND'")
+        placeholders = ','.join('?'*len(ids))
+        meta_rows = cur.execute(
+            f"SELECT id, dt, symbol, note FROM dividends WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+
+        cur.execute(f"DELETE FROM dividends WHERE id IN ({placeholders})", ids)
+        cur.execute(f"DELETE FROM cash_flows WHERE dividend_id IN ({placeholders})", ids)
+
+        for did, dtv, symbol, note in meta_rows:
+            extra_notes = [note or ""]
+            if symbol:
+                extra_notes.extend(
+                    [
+                        f"배당 성과수수료 {symbol}",
+                        f"배당 성과수수료 합계 {symbol}",
+                        f"배당 반올림 조정 {symbol}",
+                    ]
+                )
+            unique_notes = list(dict.fromkeys(extra_notes))
+            if unique_notes:
+                cur.execute(
+                    f"DELETE FROM cash_flows WHERE source='DIVIDEND' AND dividend_id IS NULL AND date(dt)=date(?) AND note IN ({','.join('?'*len(unique_notes))})",
+                    (dtv, *unique_notes),
+                )
         conn.commit()
+    invalidate_all_caches()
     return len(ids)
 
 def delete_investors_ids(ids: List[int]) -> int:
@@ -1604,7 +1763,7 @@ with T8:
                 st.warning("삭제할 행을 선택하세요.")
             else:
                 cnt = delete_cb(ids)
-                prefee_map_all.clear(); investor_positions.clear(); investor_balances.clear(); load_df.clear()
+                invalidate_all_caches()
                 st.success(f"{cnt}건 삭제 완료"); _rr()
 
     with tabA:
@@ -1637,7 +1796,7 @@ with T8:
                         cur.execute("DELETE FROM realized_pnl WHERE trade_id NOT IN (SELECT id FROM trades)")
                         conn.commit()
                     rebuild_trade_effects(from_dt=None)
-                prefee_map_all.clear(); investor_positions.clear(); investor_balances.clear(); load_df.clear()
+                invalidate_all_caches()
                 st.success("기간 내 거래 삭제 완료"); _rr()
 
         df = load_df("""
