@@ -1402,6 +1402,50 @@ with T5:
                         )
 
                         if rows_cf:
+                            expected_total = truncate_amount(total_amt, ccy_div)
+                            deposit_sum = sum(r[4] for r in rows_cf if r[3] == "DIVIDEND")
+                            round_diff = truncate_amount(expected_total - deposit_sum, ccy_div)
+
+                            if op_id and abs(round_diff) > 1e-8:
+                                if round_diff > 0:
+                                    rows_cf.append(
+                                        (
+                                            op_id,
+                                            deal_dt.isoformat(),
+                                            ccy_div,
+                                            "DIVIDEND_ROUND_ADJ",
+                                            truncate_amount(round_diff, ccy_div),
+                                            f"배당 반올림 조정 {symbol_div}",
+                                            "DIVIDEND",
+                                        )
+                                    )
+                                else:
+                                    diff = -round_diff  # deposit_sum > expected_total
+                                    for idx, row in enumerate(rows_cf):
+                                        if row[0] == op_id and row[3] == "MGMT_FEE_IN" and diff > 1e-8:
+                                            op_row = list(row)
+                                            reducible = min(diff, op_row[4])
+                                            new_amt = truncate_amount(op_row[4] - reducible, ccy_div)
+                                            diff -= reducible
+                                            if new_amt <= 1e-12:
+                                                rows_cf.pop(idx)
+                                            else:
+                                                op_row[4] = new_amt
+                                                rows_cf[idx] = tuple(op_row)
+                                            break
+                                    if diff > 1e-8:
+                                        rows_cf.append(
+                                            (
+                                                op_id,
+                                                deal_dt.isoformat(),
+                                                ccy_div,
+                                                "DIVIDEND_ROUND_ADJ",
+                                                truncate_amount(-diff, ccy_div),
+                                                f"배당 반올림 조정 {symbol_div}",
+                                                "DIVIDEND",
+                                            )
+                                        )
+
                             cur.executemany(
                                 """
                                 INSERT INTO cash_flows(
