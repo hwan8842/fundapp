@@ -242,7 +242,7 @@ def get_cash_asof(iid: int, ccy: str, asof: date) -> float:
     with get_conn() as conn:
         row = conn.execute("""
           SELECT COALESCE(SUM(CASE
-            WHEN type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN') THEN amount
+            WHEN type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN','DIVIDEND_ROUND_ADJ') THEN amount
             WHEN type IN ('WITHDRAW','MGMT_FEE_OUT') THEN -amount ELSE 0 END),0.0)
           FROM cash_flows
           WHERE investor_id=? AND ccy=? AND date(dt) <= date(?)
@@ -253,7 +253,7 @@ def get_cash(iid: int, ccy: str) -> float:
     with get_conn() as conn:
         row = conn.execute("""
           SELECT COALESCE(SUM(CASE
-            WHEN cf.type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN') THEN cf.amount
+            WHEN cf.type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN','DIVIDEND_ROUND_ADJ') THEN cf.amount
             WHEN cf.type IN ('WITHDRAW','MGMT_FEE_OUT') THEN -cf.amount ELSE 0 END),0.0)
           FROM cash_flows cf WHERE investor_id=? AND ccy=?""", (iid, ccy)).fetchone()
     return float(row[0] or 0.0)
@@ -293,11 +293,14 @@ def add_cashflow_retry(investor_id: int, dt: date, ccy: str, type_: str, amount:
             raise
 
 def record_trade(side: str, dt: date, symbol: str, ccy: str, total_qty: float, price: float,
-                 alloc_amounts: Optional[Dict[int, float]], note: str = "", edit_mode: bool = False):
+                 alloc_amounts: Optional[Dict[int, float]], note: str = "", edit_mode: bool = False,
+                 alloc_qtys: Optional[Dict[int, float]] = None):
     """
     alloc_amounts: 투자자별 '금액' 매핑(단가*수량). BUY/SELL 공통 사용
       - BUY: investor_trades.qty = alloc_amount/price, cash_flows WITHDRAW 금액 = alloc_amount
       - SELL: investor_trades.qty = alloc_amount/price, 현금흐름/수수료는 rebuild에서 계산(정책 반영)
+
+    alloc_qtys: 투자자별 실주식수 매핑(선택). 제공 시 rounding 오류 없이 investor_trades.qty에 사용.
     """
     with get_conn() as conn:
         conn.execute("PRAGMA busy_timeout=5000")
@@ -308,12 +311,35 @@ def record_trade(side: str, dt: date, symbol: str, ccy: str, total_qty: float, p
         """, (dt.isoformat(), symbol, ccy, side, total_qty, price, 0.0, json.dumps(alloc_amounts or {}), note))
         trade_id = cur.lastrowid
 
-        if alloc_amounts:
-            batch = []
+        qty_alloc_pairs: List[Tuple[int, float]] = []
+        if alloc_qtys:
+            for iid, q in alloc_qtys.items():
+                if q is None: continue
+                qf = float(q)
+                if abs(qf) <= 1e-12:
+                    continue
+                qty_alloc_pairs.append((iid, qf))
+        elif alloc_amounts:
             for iid, amt in alloc_amounts.items():
-                if amt <= 0: continue
-                q = float(amt) / float(price) if price != 0 else 0.0
-                batch.append((trade_id, iid, symbol, ccy, side, q, price, 0.0, note, 1 if edit_mode else 0))
+                if amt is None: continue
+                amt_f = float(amt)
+                if abs(amt_f) <= 1e-12:
+                    continue
+                q = (amt_f / float(price)) if price != 0 else 0.0
+                qty_alloc_pairs.append((iid, q))
+
+        if qty_alloc_pairs:
+            qty_sum = sum(q for _, q in qty_alloc_pairs)
+            diff = float(total_qty) - float(qty_sum)
+            if abs(diff) > 1e-8:
+                last_iid, last_q = qty_alloc_pairs[-1]
+                qty_alloc_pairs[-1] = (last_iid, last_q + diff)
+
+            batch = [
+                (trade_id, iid, symbol, ccy, side, q, price, 0.0, note, 1 if edit_mode else 0)
+                for iid, q in qty_alloc_pairs
+            ]
+
             cur.executemany("""
               INSERT INTO investor_trades(trade_id, investor_id, symbol, ccy, side, qty, price, fee, note, is_edit)
               VALUES (?,?,?,?,?,?,?,?,?,?)
@@ -384,6 +410,8 @@ def rebuild_trade_effects(from_dt: Optional[str] = None):
             if its.empty:
                 continue
 
+            trade_cf: List[Tuple[int, str, str, str, float, str, str]] = []
+
             # BUY: 예수금 인출(override_json의 금액 또는 qty*px)
             if side == "BUY":
                 for _, it in its.iterrows():
@@ -406,7 +434,8 @@ def rebuild_trade_effects(from_dt: Optional[str] = None):
                             elif iid in alloc_map: alloc_amt = _to_float_safe(alloc_map[iid])
                         if alloc_amt is None:
                             alloc_amt = qty * px
-                        ins_cf.append((iid, dtv, ccy, "WITHDRAW", truncate_amount(alloc_amt, ccy), f"BUY {sym}", "TRADE"))
+                        trade_cf.append((iid, dtv, ccy, "WITHDRAW", truncate_amount(alloc_amt, ccy), f"BUY {sym}", "TRADE"))
+                ins_cf.extend(trade_cf)
                 continue
 
             # SELL/EDIT: per-investor proceeds deposit + 10% fee out (profit>0), operator fee in
@@ -434,7 +463,7 @@ def rebuild_trade_effects(from_dt: Optional[str] = None):
 
                 # 투자자 DEPOSIT: 전체 매도금액(= cost + profit)
                 if abs(proceeds) > 1e-12:
-                    ins_cf.append((iid, dtv, ccy, "DEPOSIT", proceeds, f"SELL {sym}", "TRADE"))
+                    trade_cf.append((iid, dtv, ccy, "DEPOSIT", proceeds, f"SELL {sym}", "TRADE"))
 
                 # 실현손익: 총 profit 기록(보고용)
                 if abs(profit) > 1e-12:
@@ -443,13 +472,34 @@ def rebuild_trade_effects(from_dt: Optional[str] = None):
                 # 성과수수료(10%): 이익일 때만
                 fee = truncate_amount(max(0.0, profit * 0.10), ccy)
                 if fee > 0:
-                    ins_cf.append((iid, dtv, ccy, "MGMT_FEE_OUT", fee, f"성과수수료 {sym}", "TRADE"))
+                    trade_cf.append((iid, dtv, ccy, "MGMT_FEE_OUT", fee, f"성과수수료 {sym}", "TRADE"))
                     fee_sum += fee
 
             # 운용자 수취: 모든 참여자 수익 10% 합계
             op_id = get_investor_id_by_name(OPERATOR_NAME)
             if op_id and fee_sum > 0:
-                ins_cf.append((op_id, dtv, ccy, "MGMT_FEE_IN", truncate_amount(fee_sum, ccy), f"성과수수료 {sym}", "TRADE"))
+                trade_cf.append((op_id, dtv, ccy, "MGMT_FEE_IN", truncate_amount(fee_sum, ccy), f"성과수수료 {sym}", "TRADE"))
+
+            if trade_cf:
+                # rounding drift 보정: 투자자 매도금액 합계가 기대치를 초과하면 운용자 입금 조정
+                total_qty = float(its["qty"].sum())
+                expected_total = truncate_amount(total_qty * px, ccy)
+                actual_total = sum(row[4] for row in trade_cf if row[3] == "DEPOSIT")
+                if actual_total - expected_total > 1e-8:
+                    diff = actual_total - expected_total
+                    op_idx = next((idx for idx, row in enumerate(trade_cf)
+                                   if row[0] == op_id and row[3] == "MGMT_FEE_IN"), None)
+                    if op_idx is not None and diff > 0:
+                        op_row = list(trade_cf[op_idx])
+                        reducible = min(diff, op_row[4])
+                        new_amt = max(0.0, op_row[4] - reducible)
+                        op_row[4] = truncate_amount(new_amt, ccy)
+                        diff -= reducible
+                        trade_cf[op_idx] = tuple(op_row)
+                        if op_row[4] <= 1e-12:
+                            trade_cf.pop(op_idx)
+                    # diff가 남더라도 추가 조정 불필요 (운용자 입금 외에는 지침 없음)
+                ins_cf.extend(trade_cf)
 
         # 일괄 반영
         with get_conn() as conn2:
@@ -514,7 +564,7 @@ def investor_balances(ccy: str = "KRW") -> pd.DataFrame:
         return pd.read_sql_query("""
           SELECT inv.name, inv.id as investor_id,
                  COALESCE(SUM(CASE
-                   WHEN cf.type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN') THEN cf.amount
+                   WHEN cf.type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN','DIVIDEND_ROUND_ADJ') THEN cf.amount
                    WHEN cf.type IN ('WITHDRAW','MGMT_FEE_OUT') THEN -cf.amount ELSE 0 END), 0.0) as cash
           FROM investors inv
           LEFT JOIN cash_flows cf ON cf.investor_id = inv.id AND cf.ccy = ?
@@ -850,7 +900,8 @@ with T3:
                 side="SELL", dt=dtv, symbol=symbol.strip(), ccy=ccy,
                 total_qty=qty_total, price=unit_price,
                 alloc_amounts=alloc_amounts,
-                note=note if 'note' in locals() else "", edit_mode=(side=="EDIT")
+                note=note if 'note' in locals() else "", edit_mode=(side=="EDIT"),
+                alloc_qtys=qty_by_investor
             )
             st.success("기록 완료"); _rr()
 
@@ -868,7 +919,8 @@ with T3:
                 side="SELL", dt=dtv, symbol=symbol.strip(), ccy=ccy,
                 total_qty=qty_total, price=unit_price,
                 alloc_amounts={iid: truncate_amount(total_amount, ccy)},
-                note=note if 'note' in locals() else "", edit_mode=(side=="EDIT")
+                note=note if 'note' in locals() else "", edit_mode=(side=="EDIT"),
+                alloc_qtys={iid: qty_total}
             )
             st.success("기록 완료"); _rr()
 
@@ -1147,6 +1199,50 @@ with T5:
                                             f"배당 성과수수료 합계 {symbol_div}", "DIVIDEND"))
 
                         if rows_cf:
+                            expected_total = truncate_amount(total_amt, ccy_div)
+                            deposit_sum = sum(r[4] for r in rows_cf if r[3] == "DIVIDEND")
+                            round_diff = truncate_amount(expected_total - deposit_sum, ccy_div)
+
+                            if op_id and abs(round_diff) > 1e-8:
+                                if round_diff > 0:
+                                    rows_cf.append(
+                                        (
+                                            op_id,
+                                            deal_dt.isoformat(),
+                                            ccy_div,
+                                            "DIVIDEND_ROUND_ADJ",
+                                            truncate_amount(round_diff, ccy_div),
+                                            f"배당 반올림 조정 {symbol_div}",
+                                            "DIVIDEND",
+                                        )
+                                    )
+                                else:
+                                    diff = -round_diff  # deposit_sum > expected_total
+                                    for idx, row in enumerate(rows_cf):
+                                        if row[0] == op_id and row[3] == "MGMT_FEE_IN" and diff > 1e-8:
+                                            op_row = list(row)
+                                            reducible = min(diff, op_row[4])
+                                            new_amt = truncate_amount(op_row[4] - reducible, ccy_div)
+                                            diff -= reducible
+                                            if new_amt <= 1e-12:
+                                                rows_cf.pop(idx)
+                                            else:
+                                                op_row[4] = new_amt
+                                                rows_cf[idx] = tuple(op_row)
+                                            break
+                                    if diff > 1e-8:
+                                        rows_cf.append(
+                                            (
+                                                op_id,
+                                                deal_dt.isoformat(),
+                                                ccy_div,
+                                                "DIVIDEND_ROUND_ADJ",
+                                                truncate_amount(-diff, ccy_div),
+                                                f"배당 반올림 조정 {symbol_div}",
+                                                "DIVIDEND",
+                                            )
+                                        )
+
                             cur.executemany(
                                 "INSERT INTO cash_flows(investor_id, dt, ccy, type, amount, note, source) VALUES (?,?,?,?,?,?,?)",
                                 rows_cf
@@ -1162,21 +1258,134 @@ with T5:
                 # --- 교체 끝 ---
 
     st.markdown("### 최근 배당 분배 내역")
-    div_recent = load_df("""
-        SELECT cf.dt AS 일자, inv.name AS 투자자, cf.ccy AS 통화, cf.type AS 유형, cf.amount AS 금액, cf.note AS 비고
-        FROM cash_flows cf
-        JOIN investors inv ON inv.id = cf.investor_id
-        WHERE cf.source='DIVIDEND'
-        ORDER BY date(cf.dt) DESC, cf.id DESC
-        LIMIT 200
-    """)
-    if div_recent.empty:
+    div_meta = load_df(
+        """
+        SELECT id, dt, symbol, ccy, total_amount, note
+        FROM dividends
+        ORDER BY date(dt) DESC, id DESC
+        LIMIT 50
+        """
+    )
+    if div_meta.empty:
         st.info("최근 배당 분배 내역이 없습니다.")
     else:
-        div_recent_fmt = apply_row_ccy_format(div_recent.copy(), "통화", [], [], ["금액"])
-        try: div_recent_fmt["일자"] = pd.to_datetime(div_recent_fmt["일자"], errors="coerce").dt.date
-        except: pass
-        st.dataframe(div_recent_fmt, use_container_width=True)
+        try:
+            min_dt = pd.to_datetime(div_meta["dt"], errors="coerce").min().date()
+        except Exception:
+            min_dt = None
+
+        if min_dt:
+            cf_recent = load_df(
+                """
+                SELECT cf.investor_id, inv.name AS 투자자, cf.dt, cf.ccy AS 통화,
+                       cf.type, cf.amount, cf.note
+                FROM cash_flows cf
+                JOIN investors inv ON inv.id = cf.investor_id
+                WHERE cf.source='DIVIDEND' AND date(cf.dt) >= date(?)
+                """,
+                params=(min_dt.isoformat(),),
+            )
+        else:
+            cf_recent = load_df(
+                """
+                SELECT cf.investor_id, inv.name AS 투자자, cf.dt, cf.ccy AS 통화,
+                       cf.type, cf.amount, cf.note
+                FROM cash_flows cf
+                JOIN investors inv ON inv.id = cf.investor_id
+                WHERE cf.source='DIVIDEND'
+                """
+            )
+
+        if cf_recent.empty:
+            st.info("최근 배당 분배 내역이 없습니다.")
+        else:
+            records: List[Dict[str, object]] = []
+            cf_recent["note"] = cf_recent["note"].fillna("")
+
+            for div_row in div_meta.itertuples(index=False):
+                div_dt = str(div_row.dt)
+                div_ccy = div_row.ccy
+                div_note = div_row.note or ""
+                symbol = div_row.symbol or ""
+
+                base_mask = (
+                    (cf_recent["dt"] == div_dt)
+                    & (cf_recent["통화"] == div_ccy)
+                    & (cf_recent["type"] == "DIVIDEND")
+                    & (cf_recent["note"] == div_note)
+                )
+                if symbol:
+                    extra_mask = (
+                        (cf_recent["dt"] == div_dt)
+                        & (cf_recent["통화"] == div_ccy)
+                        & (cf_recent["type"] != "DIVIDEND")
+                        & cf_recent["note"].str.contains(symbol, regex=False)
+                    )
+                else:
+                    extra_mask = pd.Series(False, index=cf_recent.index)
+
+                event_rows = pd.concat(
+                    [cf_recent.loc[base_mask], cf_recent.loc[extra_mask]], ignore_index=True
+                )
+
+                if event_rows.empty:
+                    continue
+
+                for iid, grp in event_rows.groupby("investor_id"):
+                    investor_name = grp["투자자"].iloc[0]
+                    base_amt = float(grp.loc[grp["type"] == "DIVIDEND", "amount"].sum())
+                    fee_out = float(grp.loc[grp["type"] == "MGMT_FEE_OUT", "amount"].sum())
+                    fee_in = float(grp.loc[grp["type"] == "MGMT_FEE_IN", "amount"].sum())
+                    round_adj = float(
+                        grp.loc[grp["type"] == "DIVIDEND_ROUND_ADJ", "amount"].sum()
+                    )
+
+                    base_amt = truncate_amount(base_amt, div_ccy)
+                    fee_out = truncate_amount(fee_out, div_ccy)
+                    fee_in = truncate_amount(fee_in, div_ccy)
+                    round_adj = truncate_amount(round_adj, div_ccy)
+
+                    if investor_name == OPERATOR_NAME:
+                        net_amt = truncate_amount(
+                            base_amt - fee_out + fee_in - round_adj, div_ccy
+                        )
+                    else:
+                        net_amt = truncate_amount(base_amt - fee_out, div_ccy)
+
+                    records.append(
+                        {
+                            "일자": div_dt,
+                            "종목": symbol,
+                            "투자자": investor_name,
+                            "통화": div_ccy,
+                            "원배당금액": base_amt if base_amt != 0 else 0.0,
+                            "운용자수수료": fee_out if fee_out != 0 else 0.0,
+                            "운용수수료총액": fee_in if fee_in != 0 else 0.0,
+                            "반올림조정": round_adj if round_adj != 0 else 0.0,
+                            "순지급금액": net_amt,
+                            "비고": div_note,
+                        }
+                    )
+
+            if not records:
+                st.info("최근 배당 분배 내역이 없습니다.")
+            else:
+                div_recent = pd.DataFrame(records)
+                div_recent.sort_values(["일자", "종목", "투자자"], ascending=[False, True, True], inplace=True)
+                div_recent_fmt = apply_row_ccy_format(
+                    div_recent.copy(),
+                    "통화",
+                    [],
+                    [],
+                    ["원배당금액", "운용자수수료", "운용수수료총액", "반올림조정", "순지급금액"],
+                )
+                try:
+                    div_recent_fmt["일자"] = pd.to_datetime(
+                        div_recent_fmt["일자"], errors="coerce"
+                    ).dt.date
+                except Exception:
+                    pass
+                st.dataframe(div_recent_fmt, use_container_width=True)
 
 # ==============================
 # Sell Notice
