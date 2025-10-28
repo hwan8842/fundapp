@@ -293,11 +293,14 @@ def add_cashflow_retry(investor_id: int, dt: date, ccy: str, type_: str, amount:
             raise
 
 def record_trade(side: str, dt: date, symbol: str, ccy: str, total_qty: float, price: float,
-                 alloc_amounts: Optional[Dict[int, float]], note: str = "", edit_mode: bool = False):
+                 alloc_amounts: Optional[Dict[int, float]], note: str = "", edit_mode: bool = False,
+                 alloc_qtys: Optional[Dict[int, float]] = None):
     """
     alloc_amounts: 투자자별 '금액' 매핑(단가*수량). BUY/SELL 공통 사용
       - BUY: investor_trades.qty = alloc_amount/price, cash_flows WITHDRAW 금액 = alloc_amount
       - SELL: investor_trades.qty = alloc_amount/price, 현금흐름/수수료는 rebuild에서 계산(정책 반영)
+
+    alloc_qtys: 투자자별 실주식수 매핑(선택). 제공 시 rounding 오류 없이 investor_trades.qty에 사용.
     """
     with get_conn() as conn:
         conn.execute("PRAGMA busy_timeout=5000")
@@ -308,12 +311,35 @@ def record_trade(side: str, dt: date, symbol: str, ccy: str, total_qty: float, p
         """, (dt.isoformat(), symbol, ccy, side, total_qty, price, 0.0, json.dumps(alloc_amounts or {}), note))
         trade_id = cur.lastrowid
 
-        if alloc_amounts:
-            batch = []
+        qty_alloc_pairs: List[Tuple[int, float]] = []
+        if alloc_qtys:
+            for iid, q in alloc_qtys.items():
+                if q is None: continue
+                qf = float(q)
+                if abs(qf) <= 1e-12:
+                    continue
+                qty_alloc_pairs.append((iid, qf))
+        elif alloc_amounts:
             for iid, amt in alloc_amounts.items():
-                if amt <= 0: continue
-                q = float(amt) / float(price) if price != 0 else 0.0
-                batch.append((trade_id, iid, symbol, ccy, side, q, price, 0.0, note, 1 if edit_mode else 0))
+                if amt is None: continue
+                amt_f = float(amt)
+                if abs(amt_f) <= 1e-12:
+                    continue
+                q = (amt_f / float(price)) if price != 0 else 0.0
+                qty_alloc_pairs.append((iid, q))
+
+        if qty_alloc_pairs:
+            qty_sum = sum(q for _, q in qty_alloc_pairs)
+            diff = float(total_qty) - float(qty_sum)
+            if abs(diff) > 1e-8:
+                last_iid, last_q = qty_alloc_pairs[-1]
+                qty_alloc_pairs[-1] = (last_iid, last_q + diff)
+
+            batch = [
+                (trade_id, iid, symbol, ccy, side, q, price, 0.0, note, 1 if edit_mode else 0)
+                for iid, q in qty_alloc_pairs
+            ]
+
             cur.executemany("""
               INSERT INTO investor_trades(trade_id, investor_id, symbol, ccy, side, qty, price, fee, note, is_edit)
               VALUES (?,?,?,?,?,?,?,?,?,?)
@@ -850,7 +876,8 @@ with T3:
                 side="SELL", dt=dtv, symbol=symbol.strip(), ccy=ccy,
                 total_qty=qty_total, price=unit_price,
                 alloc_amounts=alloc_amounts,
-                note=note if 'note' in locals() else "", edit_mode=(side=="EDIT")
+                note=note if 'note' in locals() else "", edit_mode=(side=="EDIT"),
+                alloc_qtys=qty_by_investor
             )
             st.success("기록 완료"); _rr()
 
@@ -868,7 +895,8 @@ with T3:
                 side="SELL", dt=dtv, symbol=symbol.strip(), ccy=ccy,
                 total_qty=qty_total, price=unit_price,
                 alloc_amounts={iid: truncate_amount(total_amount, ccy)},
-                note=note if 'note' in locals() else "", edit_mode=(side=="EDIT")
+                note=note if 'note' in locals() else "", edit_mode=(side=="EDIT"),
+                alloc_qtys={iid: qty_total}
             )
             st.success("기록 완료"); _rr()
 
