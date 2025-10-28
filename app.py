@@ -1258,21 +1258,134 @@ with T5:
                 # --- 교체 끝 ---
 
     st.markdown("### 최근 배당 분배 내역")
-    div_recent = load_df("""
-        SELECT cf.dt AS 일자, inv.name AS 투자자, cf.ccy AS 통화, cf.type AS 유형, cf.amount AS 금액, cf.note AS 비고
-        FROM cash_flows cf
-        JOIN investors inv ON inv.id = cf.investor_id
-        WHERE cf.source='DIVIDEND'
-        ORDER BY date(cf.dt) DESC, cf.id DESC
-        LIMIT 200
-    """)
-    if div_recent.empty:
+    div_meta = load_df(
+        """
+        SELECT id, dt, symbol, ccy, total_amount, note
+        FROM dividends
+        ORDER BY date(dt) DESC, id DESC
+        LIMIT 50
+        """
+    )
+    if div_meta.empty:
         st.info("최근 배당 분배 내역이 없습니다.")
     else:
-        div_recent_fmt = apply_row_ccy_format(div_recent.copy(), "통화", [], [], ["금액"])
-        try: div_recent_fmt["일자"] = pd.to_datetime(div_recent_fmt["일자"], errors="coerce").dt.date
-        except: pass
-        st.dataframe(div_recent_fmt, use_container_width=True)
+        try:
+            min_dt = pd.to_datetime(div_meta["dt"], errors="coerce").min().date()
+        except Exception:
+            min_dt = None
+
+        if min_dt:
+            cf_recent = load_df(
+                """
+                SELECT cf.investor_id, inv.name AS 투자자, cf.dt, cf.ccy AS 통화,
+                       cf.type, cf.amount, cf.note
+                FROM cash_flows cf
+                JOIN investors inv ON inv.id = cf.investor_id
+                WHERE cf.source='DIVIDEND' AND date(cf.dt) >= date(?)
+                """,
+                params=(min_dt.isoformat(),),
+            )
+        else:
+            cf_recent = load_df(
+                """
+                SELECT cf.investor_id, inv.name AS 투자자, cf.dt, cf.ccy AS 통화,
+                       cf.type, cf.amount, cf.note
+                FROM cash_flows cf
+                JOIN investors inv ON inv.id = cf.investor_id
+                WHERE cf.source='DIVIDEND'
+                """
+            )
+
+        if cf_recent.empty:
+            st.info("최근 배당 분배 내역이 없습니다.")
+        else:
+            records: List[Dict[str, object]] = []
+            cf_recent["note"] = cf_recent["note"].fillna("")
+
+            for div_row in div_meta.itertuples(index=False):
+                div_dt = str(div_row.dt)
+                div_ccy = div_row.ccy
+                div_note = div_row.note or ""
+                symbol = div_row.symbol or ""
+
+                base_mask = (
+                    (cf_recent["dt"] == div_dt)
+                    & (cf_recent["통화"] == div_ccy)
+                    & (cf_recent["type"] == "DIVIDEND")
+                    & (cf_recent["note"] == div_note)
+                )
+                if symbol:
+                    extra_mask = (
+                        (cf_recent["dt"] == div_dt)
+                        & (cf_recent["통화"] == div_ccy)
+                        & (cf_recent["type"] != "DIVIDEND")
+                        & cf_recent["note"].str.contains(symbol, regex=False)
+                    )
+                else:
+                    extra_mask = pd.Series(False, index=cf_recent.index)
+
+                event_rows = pd.concat(
+                    [cf_recent.loc[base_mask], cf_recent.loc[extra_mask]], ignore_index=True
+                )
+
+                if event_rows.empty:
+                    continue
+
+                for iid, grp in event_rows.groupby("investor_id"):
+                    investor_name = grp["투자자"].iloc[0]
+                    base_amt = float(grp.loc[grp["type"] == "DIVIDEND", "amount"].sum())
+                    fee_out = float(grp.loc[grp["type"] == "MGMT_FEE_OUT", "amount"].sum())
+                    fee_in = float(grp.loc[grp["type"] == "MGMT_FEE_IN", "amount"].sum())
+                    round_adj = float(
+                        grp.loc[grp["type"] == "DIVIDEND_ROUND_ADJ", "amount"].sum()
+                    )
+
+                    base_amt = truncate_amount(base_amt, div_ccy)
+                    fee_out = truncate_amount(fee_out, div_ccy)
+                    fee_in = truncate_amount(fee_in, div_ccy)
+                    round_adj = truncate_amount(round_adj, div_ccy)
+
+                    if investor_name == OPERATOR_NAME:
+                        net_amt = truncate_amount(
+                            base_amt - fee_out + fee_in - round_adj, div_ccy
+                        )
+                    else:
+                        net_amt = truncate_amount(base_amt - fee_out, div_ccy)
+
+                    records.append(
+                        {
+                            "일자": div_dt,
+                            "종목": symbol,
+                            "투자자": investor_name,
+                            "통화": div_ccy,
+                            "원배당금액": base_amt if base_amt != 0 else 0.0,
+                            "운용자수수료": fee_out if fee_out != 0 else 0.0,
+                            "운용수수료총액": fee_in if fee_in != 0 else 0.0,
+                            "반올림조정": round_adj if round_adj != 0 else 0.0,
+                            "순지급금액": net_amt,
+                            "비고": div_note,
+                        }
+                    )
+
+            if not records:
+                st.info("최근 배당 분배 내역이 없습니다.")
+            else:
+                div_recent = pd.DataFrame(records)
+                div_recent.sort_values(["일자", "종목", "투자자"], ascending=[False, True, True], inplace=True)
+                div_recent_fmt = apply_row_ccy_format(
+                    div_recent.copy(),
+                    "통화",
+                    [],
+                    [],
+                    ["원배당금액", "운용자수수료", "운용수수료총액", "반올림조정", "순지급금액"],
+                )
+                try:
+                    div_recent_fmt["일자"] = pd.to_datetime(
+                        div_recent_fmt["일자"], errors="coerce"
+                    ).dt.date
+                except Exception:
+                    pass
+                st.dataframe(div_recent_fmt, use_container_width=True)
 
 # ==============================
 # Sell Notice
