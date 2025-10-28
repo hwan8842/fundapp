@@ -410,6 +410,8 @@ def rebuild_trade_effects(from_dt: Optional[str] = None):
             if its.empty:
                 continue
 
+            trade_cf: List[Tuple[int, str, str, str, float, str, str]] = []
+
             # BUY: 예수금 인출(override_json의 금액 또는 qty*px)
             if side == "BUY":
                 for _, it in its.iterrows():
@@ -432,7 +434,8 @@ def rebuild_trade_effects(from_dt: Optional[str] = None):
                             elif iid in alloc_map: alloc_amt = _to_float_safe(alloc_map[iid])
                         if alloc_amt is None:
                             alloc_amt = qty * px
-                        ins_cf.append((iid, dtv, ccy, "WITHDRAW", truncate_amount(alloc_amt, ccy), f"BUY {sym}", "TRADE"))
+                        trade_cf.append((iid, dtv, ccy, "WITHDRAW", truncate_amount(alloc_amt, ccy), f"BUY {sym}", "TRADE"))
+                ins_cf.extend(trade_cf)
                 continue
 
             # SELL/EDIT: per-investor proceeds deposit + 10% fee out (profit>0), operator fee in
@@ -460,7 +463,7 @@ def rebuild_trade_effects(from_dt: Optional[str] = None):
 
                 # 투자자 DEPOSIT: 전체 매도금액(= cost + profit)
                 if abs(proceeds) > 1e-12:
-                    ins_cf.append((iid, dtv, ccy, "DEPOSIT", proceeds, f"SELL {sym}", "TRADE"))
+                    trade_cf.append((iid, dtv, ccy, "DEPOSIT", proceeds, f"SELL {sym}", "TRADE"))
 
                 # 실현손익: 총 profit 기록(보고용)
                 if abs(profit) > 1e-12:
@@ -469,13 +472,34 @@ def rebuild_trade_effects(from_dt: Optional[str] = None):
                 # 성과수수료(10%): 이익일 때만
                 fee = truncate_amount(max(0.0, profit * 0.10), ccy)
                 if fee > 0:
-                    ins_cf.append((iid, dtv, ccy, "MGMT_FEE_OUT", fee, f"성과수수료 {sym}", "TRADE"))
+                    trade_cf.append((iid, dtv, ccy, "MGMT_FEE_OUT", fee, f"성과수수료 {sym}", "TRADE"))
                     fee_sum += fee
 
             # 운용자 수취: 모든 참여자 수익 10% 합계
             op_id = get_investor_id_by_name(OPERATOR_NAME)
             if op_id and fee_sum > 0:
-                ins_cf.append((op_id, dtv, ccy, "MGMT_FEE_IN", truncate_amount(fee_sum, ccy), f"성과수수료 {sym}", "TRADE"))
+                trade_cf.append((op_id, dtv, ccy, "MGMT_FEE_IN", truncate_amount(fee_sum, ccy), f"성과수수료 {sym}", "TRADE"))
+
+            if trade_cf:
+                # rounding drift 보정: 투자자 매도금액 합계가 기대치를 초과하면 운용자 입금 조정
+                total_qty = float(its["qty"].sum())
+                expected_total = truncate_amount(total_qty * px, ccy)
+                actual_total = sum(row[4] for row in trade_cf if row[3] == "DEPOSIT")
+                if actual_total - expected_total > 1e-8:
+                    diff = actual_total - expected_total
+                    op_idx = next((idx for idx, row in enumerate(trade_cf)
+                                   if row[0] == op_id and row[3] == "MGMT_FEE_IN"), None)
+                    if op_idx is not None and diff > 0:
+                        op_row = list(trade_cf[op_idx])
+                        reducible = min(diff, op_row[4])
+                        new_amt = max(0.0, op_row[4] - reducible)
+                        op_row[4] = truncate_amount(new_amt, ccy)
+                        diff -= reducible
+                        trade_cf[op_idx] = tuple(op_row)
+                        if op_row[4] <= 1e-12:
+                            trade_cf.pop(op_idx)
+                    # diff가 남더라도 추가 조정 불필요 (운용자 입금 외에는 지침 없음)
+                ins_cf.extend(trade_cf)
 
         # 일괄 반영
         with get_conn() as conn2:
@@ -1175,6 +1199,23 @@ with T5:
                                             f"배당 성과수수료 합계 {symbol_div}", "DIVIDEND"))
 
                         if rows_cf:
+                            expected_total = truncate_amount(total_amt, ccy_div)
+                            deposit_sum = sum(r[4] for r in rows_cf if r[3] == "DIVIDEND")
+                            if deposit_sum - expected_total > 1e-8 and op_id:
+                                diff = deposit_sum - expected_total
+                                for idx, row in enumerate(rows_cf):
+                                    if row[0] == op_id and row[3] == "MGMT_FEE_IN" and diff > 0:
+                                        op_row = list(row)
+                                        reducible = min(diff, op_row[4])
+                                        new_amt = max(0.0, op_row[4] - reducible)
+                                        op_row[4] = truncate_amount(new_amt, ccy_div)
+                                        diff -= reducible
+                                        if op_row[4] <= 1e-12:
+                                            rows_cf.pop(idx)
+                                        else:
+                                            rows_cf[idx] = tuple(op_row)
+                                        break
+
                             cur.executemany(
                                 "INSERT INTO cash_flows(investor_id, dt, ccy, type, amount, note, source) VALUES (?,?,?,?,?,?,?)",
                                 rows_cf
