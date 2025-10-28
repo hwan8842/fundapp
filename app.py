@@ -242,7 +242,7 @@ def get_cash_asof(iid: int, ccy: str, asof: date) -> float:
     with get_conn() as conn:
         row = conn.execute("""
           SELECT COALESCE(SUM(CASE
-            WHEN type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN') THEN amount
+            WHEN type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN','DIVIDEND_ROUND_ADJ') THEN amount
             WHEN type IN ('WITHDRAW','MGMT_FEE_OUT') THEN -amount ELSE 0 END),0.0)
           FROM cash_flows
           WHERE investor_id=? AND ccy=? AND date(dt) <= date(?)
@@ -253,7 +253,7 @@ def get_cash(iid: int, ccy: str) -> float:
     with get_conn() as conn:
         row = conn.execute("""
           SELECT COALESCE(SUM(CASE
-            WHEN cf.type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN') THEN cf.amount
+            WHEN cf.type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN','DIVIDEND_ROUND_ADJ') THEN cf.amount
             WHEN cf.type IN ('WITHDRAW','MGMT_FEE_OUT') THEN -cf.amount ELSE 0 END),0.0)
           FROM cash_flows cf WHERE investor_id=? AND ccy=?""", (iid, ccy)).fetchone()
     return float(row[0] or 0.0)
