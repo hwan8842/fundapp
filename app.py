@@ -89,9 +89,13 @@ def _to_float_safe(v):
 
 def truncate_amount(amount: float, ccy: str) -> float:
     amount = _to_float_safe(amount)
+    base = amount or 0.0
     if ccy == "KRW":
-        return math.floor((amount or 0.0) * 100) / 100.0
-    return round((amount or 0.0), 2)
+        scaled = base * 100
+        if scaled >= 0:
+            return math.floor(scaled) / 100.0
+        return math.ceil(scaled) / 100.0
+    return round(base, 2)
 
 def fmt_qty_2(val) -> str:
     try: return f"{float(val):,.2f}"
