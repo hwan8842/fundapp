@@ -618,7 +618,7 @@ def build_dividend_cashflows(
     memo: str,
     pos_rec: pd.DataFrame,
     op_id: Optional[int],
-) -> List[Tuple[int, str, str, str, float, str, str, int]]:
+) -> List[Dict[str, Any]]:
     if pos_rec.empty:
         return []
 
@@ -710,20 +710,22 @@ def build_dividend_cashflows(
                     }
                 )
 
-    out_rows = [
-        (
-            row["investor_id"],
-            deal_dt.isoformat(),
-            ccy,
-            row["type"],
-            row["amount"],
-            row["note"],
-            "DIVIDEND",
-            dividend_id,
+    out_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        if abs(row["amount"]) <= 1e-12:
+            continue
+        out_rows.append(
+            {
+                "investor_id": row["investor_id"],
+                "dt": deal_dt.isoformat(),
+                "ccy": ccy,
+                "type": row["type"],
+                "amount": row["amount"],
+                "note": row.get("note", ""),
+                "source": "DIVIDEND",
+                "dividend_id": dividend_id,
+            }
         )
-        for row in rows
-        if abs(row["amount"]) > 1e-12
-    ]
     return out_rows
 
 
@@ -793,10 +795,7 @@ def summarize_dividend_history(div_meta: pd.DataFrame, cf_recent: pd.DataFrame) 
                     "통화": div.ccy,
                     "원배당금액": base_amt if base_amt != 0 else 0.0,
                     "운용자수수료": fee_out if fee_out != 0 else 0.0,
-                    "운용수수료총액": fee_in if fee_in != 0 else 0.0,
-                    "반올림조정": round_adj if round_adj != 0 else 0.0,
                     "순지급금액": net_amt,
-                    "비고": div.note or "",
                 }
             )
 
@@ -1451,7 +1450,7 @@ with T5:
                                 """
                                 INSERT INTO cash_flows(
                                     investor_id, dt, ccy, type, amount, note, source, dividend_id
-                                ) VALUES (?,?,?,?,?,?,?,?)
+                                ) VALUES (:investor_id, :dt, :ccy, :type, :amount, :note, :source, :dividend_id)
                                 """,
                                 rows_cf,
                             )
@@ -1513,7 +1512,7 @@ with T5:
                     "통화",
                     [],
                     [],
-                    ["원배당금액", "운용자수수료", "운용수수료총액", "반올림조정", "순지급금액"],
+                    ["원배당금액", "운용자수수료", "순지급금액"],
                 )
                 try:
                     div_summary_fmt["일자"] = pd.to_datetime(
