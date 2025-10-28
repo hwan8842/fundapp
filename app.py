@@ -242,7 +242,7 @@ def get_cash_asof(iid: int, ccy: str, asof: date) -> float:
     with get_conn() as conn:
         row = conn.execute("""
           SELECT COALESCE(SUM(CASE
-            WHEN type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN') THEN amount
+            WHEN type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN','DIVIDEND_ROUND_ADJ') THEN amount
             WHEN type IN ('WITHDRAW','MGMT_FEE_OUT') THEN -amount ELSE 0 END),0.0)
           FROM cash_flows
           WHERE investor_id=? AND ccy=? AND date(dt) <= date(?)
@@ -253,7 +253,7 @@ def get_cash(iid: int, ccy: str) -> float:
     with get_conn() as conn:
         row = conn.execute("""
           SELECT COALESCE(SUM(CASE
-            WHEN cf.type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN') THEN cf.amount
+            WHEN cf.type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN','DIVIDEND_ROUND_ADJ') THEN cf.amount
             WHEN cf.type IN ('WITHDRAW','MGMT_FEE_OUT') THEN -cf.amount ELSE 0 END),0.0)
           FROM cash_flows cf WHERE investor_id=? AND ccy=?""", (iid, ccy)).fetchone()
     return float(row[0] or 0.0)
@@ -564,7 +564,7 @@ def investor_balances(ccy: str = "KRW") -> pd.DataFrame:
         return pd.read_sql_query("""
           SELECT inv.name, inv.id as investor_id,
                  COALESCE(SUM(CASE
-                   WHEN cf.type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN') THEN cf.amount
+                   WHEN cf.type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN','DIVIDEND_ROUND_ADJ') THEN cf.amount
                    WHEN cf.type IN ('WITHDRAW','MGMT_FEE_OUT') THEN -cf.amount ELSE 0 END), 0.0) as cash
           FROM investors inv
           LEFT JOIN cash_flows cf ON cf.investor_id = inv.id AND cf.ccy = ?
@@ -1201,20 +1201,47 @@ with T5:
                         if rows_cf:
                             expected_total = truncate_amount(total_amt, ccy_div)
                             deposit_sum = sum(r[4] for r in rows_cf if r[3] == "DIVIDEND")
-                            if deposit_sum - expected_total > 1e-8 and op_id:
-                                diff = deposit_sum - expected_total
-                                for idx, row in enumerate(rows_cf):
-                                    if row[0] == op_id and row[3] == "MGMT_FEE_IN" and diff > 0:
-                                        op_row = list(row)
-                                        reducible = min(diff, op_row[4])
-                                        new_amt = max(0.0, op_row[4] - reducible)
-                                        op_row[4] = truncate_amount(new_amt, ccy_div)
-                                        diff -= reducible
-                                        if op_row[4] <= 1e-12:
-                                            rows_cf.pop(idx)
-                                        else:
-                                            rows_cf[idx] = tuple(op_row)
-                                        break
+                            round_diff = truncate_amount(expected_total - deposit_sum, ccy_div)
+
+                            if op_id and abs(round_diff) > 1e-8:
+                                if round_diff > 0:
+                                    rows_cf.append(
+                                        (
+                                            op_id,
+                                            deal_dt.isoformat(),
+                                            ccy_div,
+                                            "DIVIDEND_ROUND_ADJ",
+                                            truncate_amount(round_diff, ccy_div),
+                                            f"배당 반올림 조정 {symbol_div}",
+                                            "DIVIDEND",
+                                        )
+                                    )
+                                else:
+                                    diff = -round_diff  # deposit_sum > expected_total
+                                    for idx, row in enumerate(rows_cf):
+                                        if row[0] == op_id and row[3] == "MGMT_FEE_IN" and diff > 1e-8:
+                                            op_row = list(row)
+                                            reducible = min(diff, op_row[4])
+                                            new_amt = truncate_amount(op_row[4] - reducible, ccy_div)
+                                            diff -= reducible
+                                            if new_amt <= 1e-12:
+                                                rows_cf.pop(idx)
+                                            else:
+                                                op_row[4] = new_amt
+                                                rows_cf[idx] = tuple(op_row)
+                                            break
+                                    if diff > 1e-8:
+                                        rows_cf.append(
+                                            (
+                                                op_id,
+                                                deal_dt.isoformat(),
+                                                ccy_div,
+                                                "DIVIDEND_ROUND_ADJ",
+                                                truncate_amount(-diff, ccy_div),
+                                                f"배당 반올림 조정 {symbol_div}",
+                                                "DIVIDEND",
+                                            )
+                                        )
 
                             cur.executemany(
                                 "INSERT INTO cash_flows(investor_id, dt, ccy, type, amount, note, source) VALUES (?,?,?,?,?,?,?)",
