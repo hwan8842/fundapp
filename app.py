@@ -50,8 +50,57 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==============================
+# Data Structures
+# ==============================
+
+
+class DividendCashflowRow(NamedTuple):
+    investor_id: int
+    dt: str
+    ccy: str
+    type: str
+    amount: float
+    note: str
+    source: str
+    dividend_id: int
+
+
+# ==============================
 # Small Utilities
 # ==============================
+
+_CASHFLOW_FIELD_INDEX = {"investor_id": 0, "type": 3, "amount": 4}
+
+def cashflow_field(row: Any, field: str):
+    """Best-effort accessor that works for tuples, named tuples, dicts, or lists."""
+    if isinstance(row, DividendCashflowRow):
+        return getattr(row, field)
+    if isinstance(row, dict):
+        return row.get(field)
+    if isinstance(row, (list, tuple)):
+        idx = _CASHFLOW_FIELD_INDEX.get(field)
+        if idx is not None and len(row) > idx:
+            return row[idx]
+    return getattr(row, field, None)
+
+def cashflow_amount(row: Any) -> float:
+    val = cashflow_field(row, "amount")
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return 0.0
+
+def cashflow_type(row: Any) -> str:
+    val = cashflow_field(row, "type")
+    return str(val) if val is not None else ""
+
+def cashflow_investor(row: Any) -> Optional[int]:
+    val = cashflow_field(row, "investor_id")
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
 def _rr():
     try: st.rerun()
     except Exception:
@@ -488,6 +537,22 @@ def rebuild_trade_effects(from_dt: Optional[str] = None):
                 # rounding drift 보정: 투자자 매도금액 합계가 기대치를 초과하면 운용자 입금 조정
                 total_qty = float(its["qty"].sum())
                 expected_total = truncate_amount(total_qty * px, ccy)
+                actual_total = sum(cashflow_amount(row) for row in trade_cf if cashflow_type(row) == "DEPOSIT")
+                if actual_total - expected_total > 1e-8:
+                    diff = actual_total - expected_total
+                    op_idx = next((idx for idx, row in enumerate(trade_cf)
+                                   if cashflow_investor(row) == op_id and cashflow_type(row) == "MGMT_FEE_IN"), None)
+                    if op_idx is not None and diff > 0:
+                        op_row = list(trade_cf[op_idx])
+                        current_amt = cashflow_amount(op_row)
+                        reducible = min(diff, current_amt)
+                        new_amt = truncate_amount(max(0.0, current_amt - reducible), ccy)
+                        diff -= reducible
+                        if new_amt <= 1e-12:
+                            trade_cf.pop(op_idx)
+                        else:
+                            op_row[4] = new_amt
+                            trade_cf[op_idx] = tuple(op_row)
                 actual_total = sum(row[4] for row in trade_cf if row[3] == "DEPOSIT")
                 if actual_total - expected_total > 1e-8:
                     diff = actual_total - expected_total
@@ -618,6 +683,7 @@ def build_dividend_cashflows(
     memo: str,
     pos_rec: pd.DataFrame,
     op_id: Optional[int],
+) -> List[DividendCashflowRow]:
 ) -> List[Dict[str, Any]]:
     if pos_rec.empty:
         return []
@@ -710,6 +776,23 @@ def build_dividend_cashflows(
                     }
                 )
 
+    out_rows: List[DividendCashflowRow] = []
+    dt_iso = deal_dt.isoformat()
+    for row in rows:
+        amt = truncate_amount(row["amount"], ccy)
+        if abs(amt) <= 1e-12:
+            continue
+        out_rows.append(
+            DividendCashflowRow(
+                investor_id=row["investor_id"],
+                dt=dt_iso,
+                ccy=ccy,
+                type=row["type"],
+                amount=amt,
+                note=row.get("note", ""),
+                source="DIVIDEND",
+                dividend_id=dividend_id,
+            )
     out_rows: List[Dict[str, Any]] = []
     for row in rows:
         if abs(row["amount"]) <= 1e-12:
@@ -1450,6 +1533,7 @@ with T5:
                                 """
                                 INSERT INTO cash_flows(
                                     investor_id, dt, ccy, type, amount, note, source, dividend_id
+                                ) VALUES (?,?,?,?,?,?,?,?)
                                 ) VALUES (:investor_id, :dt, :ccy, :type, :amount, :note, :source, :dividend_id)
                                 """,
                                 rows_cf,
