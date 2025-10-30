@@ -3,7 +3,7 @@ import streamlit.components.v1 as components
 import sqlite3
 import pandas as pd
 from datetime import datetime, date, timedelta
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, NamedTuple
 import json, math, time
 import numpy as np
 import altair as alt
@@ -48,6 +48,22 @@ st.markdown("""
   .card { border:1px solid #e5e7eb; border-radius:12px; padding:16px; background:#fff; }
 </style>
 """, unsafe_allow_html=True)
+
+# ==============================
+# Data Structures
+# ==============================
+
+
+class DividendCashflowRow(NamedTuple):
+    investor_id: int
+    dt: str
+    ccy: str
+    type: str
+    amount: float
+    note: str
+    source: str
+    dividend_id: int
+
 
 # ==============================
 # Small Utilities
@@ -618,7 +634,7 @@ def build_dividend_cashflows(
     memo: str,
     pos_rec: pd.DataFrame,
     op_id: Optional[int],
-) -> List[Tuple[Any, ...]]:
+) -> List[DividendCashflowRow]:
     if pos_rec.empty:
         return []
 
@@ -710,21 +726,22 @@ def build_dividend_cashflows(
                     }
                 )
 
-    out_rows: List[Tuple[Any, ...]] = []
+    out_rows: List[DividendCashflowRow] = []
+    dt_iso = deal_dt.isoformat()
     for row in rows:
         amt = truncate_amount(row["amount"], ccy)
         if abs(amt) <= 1e-12:
             continue
         out_rows.append(
-            (
-                row["investor_id"],
-                deal_dt.isoformat(),
-                ccy,
-                row["type"],
-                amt,
-                row.get("note", ""),
-                "DIVIDEND",
-                dividend_id,
+            DividendCashflowRow(
+                investor_id=row["investor_id"],
+                dt=dt_iso,
+                ccy=ccy,
+                type=row["type"],
+                amount=amt,
+                note=row.get("note", ""),
+                source="DIVIDEND",
+                dividend_id=dividend_id,
             )
         )
     return out_rows
