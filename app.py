@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple, Optional
 import json, math, time
 import numpy as np
 import altair as alt
+import re
 
 # ==============================
 # Globals & Constants
@@ -785,9 +786,10 @@ with T3:
         if order_mode == "개별":
             sel_name_ind = st.selectbox("개별 투자자", inv_all_df["name"].tolist(), key="order_ind_name")
 
-        # SELL/EDIT일 때만 100% 매도
-        is_sell_like = (side in ("SELL","EDIT"))
-        if not is_sell_like and st.session_state.get("sell_all", False):
+        # SELL/EDIT 외 모드에서도 체크박스는 노출하되 BUY에서는 안내 처리
+        is_sell_like = (side in ("SELL", "EDIT"))
+        if side == "BUY" and st.session_state.get("sell_all", False):
+            st.warning("매수 주문이라 이용 불가능합니다.")
             st.session_state["sell_all"] = False
 
         # 4행: 주문 금액 / 주식수 / 100% 매도
@@ -807,9 +809,12 @@ with T3:
             sell_all = st.checkbox(
                 "100% 매도",
                 value=st.session_state.get("sell_all", False),
-                disabled=not is_sell_like,
                 key="sell_all"
             )
+            if side == "BUY" and sell_all:
+                st.warning("매수 주문이라 이용 불가능합니다.")
+                st.session_state["sell_all"] = False
+                sell_all = False
 
         # 5행: 비고 + 기록
         with st.expander("비고", expanded=False):
@@ -1232,17 +1237,72 @@ with T5:
 
     st.markdown("### 최근 배당 분배 내역")
     div_recent = load_df("""
-        SELECT cf.dt AS 일자, inv.name AS 투자자, cf.ccy AS 통화, cf.type AS 유형, cf.amount AS 금액, cf.note AS 비고
-        FROM cash_flows cf
-        JOIN investors inv ON inv.id = cf.investor_id
-        WHERE cf.source='DIVIDEND'
-        ORDER BY date(cf.dt) DESC, cf.id DESC
+        SELECT base.일자,
+               base.투자자,
+               base.통화,
+               base.금액,
+               base.last_cf_id,
+               base.div_note,
+               base.fee_out_note,
+               base.fee_in_note,
+               div.symbol AS div_symbol
+        FROM (
+            SELECT cf.dt AS 일자,
+                   inv.name AS 투자자,
+                   cf.ccy AS 통화,
+                   SUM(CASE
+                           WHEN cf.type IN ('DIVIDEND', 'MGMT_FEE_IN') THEN cf.amount
+                           WHEN cf.type = 'MGMT_FEE_OUT' THEN -cf.amount
+                           ELSE 0
+                       END) AS 금액,
+                   MAX(cf.id) AS last_cf_id,
+                   MAX(CASE WHEN cf.type = 'DIVIDEND' THEN cf.note END) AS div_note,
+                   MAX(CASE WHEN cf.type = 'MGMT_FEE_OUT' THEN cf.note END) AS fee_out_note,
+                   MAX(CASE WHEN cf.type = 'MGMT_FEE_IN' THEN cf.note END) AS fee_in_note
+            FROM cash_flows cf
+            JOIN investors inv ON inv.id = cf.investor_id
+            WHERE cf.source='DIVIDEND'
+            GROUP BY cf.dt, cf.investor_id, inv.name, cf.ccy
+        ) AS base
+        LEFT JOIN dividends div
+               ON div.dt = base.일자
+              AND div.ccy = base.통화
+              AND ((div.note IS NULL AND base.div_note IS NULL)
+                   OR (div.note = base.div_note))
+        ORDER BY date(base.일자) DESC, base.last_cf_id DESC
         LIMIT 200
     """)
     if div_recent.empty:
         st.info("최근 배당 분배 내역이 없습니다.")
     else:
-        div_recent_fmt = apply_row_ccy_format(div_recent.copy(), "통화", [], [], ["금액"])
+        def _extract_symbol(notes: List[Optional[str]], fallback: Optional[str]) -> str:
+            for note in notes:
+                if not note or not isinstance(note, str):
+                    continue
+                match = re.search(r"배당\s+([^\s()]+)", note)
+                if match:
+                    return match.group(1)
+                match = re.search(r"성과수수료(?:\s+합계)?\s+([^\s()]+)", note)
+                if match:
+                    return match.group(1)
+            if fallback and isinstance(fallback, str):
+                return fallback
+            return ""
+
+        div_recent["종목명"] = div_recent.apply(
+            lambda row: _extract_symbol([
+                row.get("div_note"),
+                row.get("fee_out_note"),
+                row.get("fee_in_note"),
+            ], row.get("div_symbol")),
+            axis=1,
+        )
+        div_recent["비고"] = ""
+        div_recent = div_recent.drop(columns=["div_note", "fee_out_note", "fee_in_note", "div_symbol"], errors="ignore")
+        div_recent_fmt = apply_row_ccy_format(
+            div_recent[["일자", "투자자", "통화", "종목명", "금액", "비고"]].copy(),
+            "통화", [], [], ["금액"]
+        )
         try: div_recent_fmt["일자"] = pd.to_datetime(div_recent_fmt["일자"], errors="coerce").dt.date
         except: pass
         st.dataframe(div_recent_fmt, use_container_width=True)
@@ -1341,31 +1401,86 @@ with T7:
         with c1: p_start = st.date_input("시작일", value=today - timedelta(days=30), key="pnl_start")
         with c2: p_end   = st.date_input("종료일", value=today, key="pnl_end")
 
-    pnl = load_df("""
-      SELECT rp.investor_id, inv.name AS 투자자, rp.ccy AS 통화, rp.amount AS 차익, t.dt AS 일자
+    inv_df = list_investors()
+    inv_choices = ["전체"]
+    inv_map = {"전체": None}
+    if not inv_df.empty:
+        for _, row in inv_df.iterrows():
+            name = row.get("name")
+            if not isinstance(name, str):
+                continue
+            inv_choices.append(name)
+            inv_map[name] = int(row.get("id"))
+    selected_inv = st.selectbox("투자자", options=inv_choices, index=0)
+    selected_inv_id = inv_map.get(selected_inv)
+
+    pnl_query = """
+      SELECT rp.investor_id, inv.name AS 투자자, rp.ccy AS 통화, rp.amount AS 차익
       FROM realized_pnl rp
       JOIN investors inv ON inv.id = rp.investor_id
       JOIN trades t ON t.id = rp.trade_id
       WHERE date(t.dt) BETWEEN date(?) AND date(?)
-      ORDER BY date(t.dt) DESC, rp.investor_id
-    """, params=(p_start.isoformat(), p_end.isoformat()))
-    if pnl.empty:
-        st.info("해당 기간 실현 차익 데이터가 없습니다.")
-    else:
-        try: pnl["일자"] = pd.to_datetime(pnl["일자"], errors="coerce").dt.date
-        except: pass
-        st.markdown("#### 투자자별 실현 차익")
-        agg_inv = pnl.groupby(["투자자","통화"], as_index=False)["차익"].sum()
-        def _fmt_row(row):
-            return fmt_by_ccy(row["차익"], row["통화"], "amount")
-        show_inv = agg_inv.copy()
-        show_inv["차익"] = show_inv.apply(_fmt_row, axis=1)
-        st.dataframe(show_inv, use_container_width=True)
+    """
+    pnl_params: List = [p_start.isoformat(), p_end.isoformat()]
+    if selected_inv_id is not None:
+        pnl_query += " AND rp.investor_id = ?"
+        pnl_params.append(selected_inv_id)
+    pnl_query += " ORDER BY date(t.dt) DESC, rp.investor_id"
+    pnl = load_df(pnl_query, params=tuple(pnl_params))
 
-        st.markdown("#### 거래별 실현 차익 (상세)")
-        show_tx = pnl.copy()
-        show_tx["표시 차익"] = show_tx.apply(lambda r: fmt_by_ccy(r["차익"], r["통화"], "amount"), axis=1)
-        st.dataframe(show_tx[["일자","투자자","통화","표시 차익"]], use_container_width=True)
+    div_query = """
+      SELECT inv.name AS 투자자, cf.ccy AS 통화,
+             SUM(CASE
+                     WHEN cf.type IN ('DIVIDEND','MGMT_FEE_IN') THEN cf.amount
+                     WHEN cf.type = 'MGMT_FEE_OUT' THEN -cf.amount
+                     ELSE 0
+                 END) AS dividend_income
+      FROM cash_flows cf
+      JOIN investors inv ON inv.id = cf.investor_id
+      WHERE cf.source = 'DIVIDEND'
+        AND date(cf.dt) BETWEEN date(?) AND date(?)
+    """
+    div_params: List = [p_start.isoformat(), p_end.isoformat()]
+    if selected_inv_id is not None:
+        div_query += " AND cf.investor_id = ?"
+        div_params.append(selected_inv_id)
+    div_query += " GROUP BY inv.name, cf.ccy"
+    div_df_raw = load_df(div_query, params=tuple(div_params))
+    div_df = (div_df_raw.rename(columns={"dividend_income": "배당 수익"})
+              if not div_df_raw.empty else pd.DataFrame(columns=["투자자", "통화", "배당 수익"]))
+
+    agg_inv = (pnl.groupby(["투자자", "통화"], as_index=False)["차익"].sum()
+               if not pnl.empty else pd.DataFrame(columns=["투자자", "통화", "차익"]))
+
+    combined = pd.merge(
+        agg_inv,
+        div_df,
+        on=["투자자", "통화"],
+        how="outer"
+    )
+
+    if combined.empty:
+        st.info("해당 기간 수익 데이터가 없습니다.")
+    else:
+        if "차익" not in combined.columns:
+            combined["차익"] = 0.0
+        if "배당 수익" not in combined.columns:
+            combined["배당 수익"] = 0.0
+        combined[["차익", "배당 수익"]] = combined[["차익", "배당 수익"]].fillna(0.0)
+        show_inv = combined.sort_values(["투자자", "통화"]).reset_index(drop=True)
+        for col in ["차익", "배당 수익"]:
+            show_inv[col] = show_inv.apply(lambda r: fmt_by_ccy(r[col], r["통화"], "amount"), axis=1)
+        st.markdown("#### 투자자별 실현 차익")
+        st.dataframe(
+            show_inv,
+            use_container_width=True,
+            column_config={
+                "투자자": st.column_config.TextColumn("투자자", width=200),
+                "통화": st.column_config.TextColumn("통화", width=80),
+                "차익": st.column_config.TextColumn("차익", width=160),
+                "배당 수익": st.column_config.TextColumn("배당 수익", width=160),
+            },
+        )
 
 # ==============================
 # Admin / Delete
