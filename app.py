@@ -802,7 +802,6 @@ with T3:
             qty_input = st.number_input(
                 "주식수",
                 min_value=0.0, step=0.00001, format="%.5f",
-                disabled=(is_sell_like and st.session_state.get("sell_all", False))
             )
 
         with c_full:
