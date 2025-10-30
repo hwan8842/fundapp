@@ -786,9 +786,10 @@ with T3:
         if order_mode == "개별":
             sel_name_ind = st.selectbox("개별 투자자", inv_all_df["name"].tolist(), key="order_ind_name")
 
-        # SELL/EDIT일 때만 100% 매도
-        is_sell_like = (side in ("SELL","EDIT"))
-        if not is_sell_like and st.session_state.get("sell_all", False):
+        # SELL/EDIT 외 모드에서도 체크박스는 노출하되 BUY에서는 안내 처리
+        is_sell_like = (side in ("SELL", "EDIT"))
+        if side == "BUY" and st.session_state.get("sell_all", False):
+            st.warning("매수 주문이라 이용 불가능합니다.")
             st.session_state["sell_all"] = False
 
         # 4행: 주문 금액 / 주식수 / 100% 매도
@@ -808,9 +809,12 @@ with T3:
             sell_all = st.checkbox(
                 "100% 매도",
                 value=st.session_state.get("sell_all", False),
-                disabled=not is_sell_like,
                 key="sell_all"
             )
+            if side == "BUY" and sell_all:
+                st.warning("매수 주문이라 이용 불가능합니다.")
+                st.session_state["sell_all"] = False
+                sell_all = False
 
         # 5행: 비고 + 기록
         with st.expander("비고", expanded=False):
