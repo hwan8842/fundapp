@@ -1232,33 +1232,17 @@ with T5:
 
     st.markdown("### 최근 배당 분배 내역")
     div_recent = load_df("""
-        SELECT 일자, 투자자, 통화, 금액, last_cf_id FROM (
-            SELECT cf.dt AS 일자,
-                   inv.name AS 투자자,
-                   cf.ccy AS 통화,
-                   SUM(CASE
-                           WHEN cf.type IN ('DIVIDEND', 'MGMT_FEE_IN') THEN cf.amount
-                           WHEN cf.type = 'MGMT_FEE_OUT' THEN -cf.amount
-                           ELSE 0
-                       END) AS 금액,
-                   MAX(cf.id) AS last_cf_id
-            FROM cash_flows cf
-            JOIN investors inv ON inv.id = cf.investor_id
-            WHERE cf.source='DIVIDEND'
-            GROUP BY cf.dt, cf.investor_id, inv.name, cf.ccy
-        )
-        ORDER BY date(일자) DESC, last_cf_id DESC
+        SELECT cf.dt AS 일자, inv.name AS 투자자, cf.ccy AS 통화, cf.type AS 유형, cf.amount AS 금액, cf.note AS 비고
+        FROM cash_flows cf
+        JOIN investors inv ON inv.id = cf.investor_id
+        WHERE cf.source='DIVIDEND'
+        ORDER BY date(cf.dt) DESC, cf.id DESC
         LIMIT 200
     """)
     if div_recent.empty:
         st.info("최근 배당 분배 내역이 없습니다.")
     else:
-        div_recent["유형"] = "DIVIDEND"
-        div_recent["비고"] = ""
-        div_recent_fmt = apply_row_ccy_format(
-            div_recent[["일자", "투자자", "통화", "유형", "금액", "비고"]].copy(),
-            "통화", [], [], ["금액"]
-        )
+        div_recent_fmt = apply_row_ccy_format(div_recent.copy(), "통화", [], [], ["금액"])
         try: div_recent_fmt["일자"] = pd.to_datetime(div_recent_fmt["일자"], errors="coerce").dt.date
         except: pass
         st.dataframe(div_recent_fmt, use_container_width=True)
