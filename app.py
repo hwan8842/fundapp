@@ -3,7 +3,7 @@ import streamlit.components.v1 as components
 import sqlite3
 import pandas as pd
 from datetime import datetime, date, timedelta
-from typing import Any, Dict, List, Tuple, Optional, NamedTuple
+from typing import Any, Dict, List, Tuple, Optional
 import json, math, time
 import numpy as np
 import altair as alt
@@ -553,6 +553,20 @@ def rebuild_trade_effects(from_dt: Optional[str] = None):
                         else:
                             op_row[4] = new_amt
                             trade_cf[op_idx] = tuple(op_row)
+                actual_total = sum(row[4] for row in trade_cf if row[3] == "DEPOSIT")
+                if actual_total - expected_total > 1e-8:
+                    diff = actual_total - expected_total
+                    op_idx = next((idx for idx, row in enumerate(trade_cf)
+                                   if row[0] == op_id and row[3] == "MGMT_FEE_IN"), None)
+                    if op_idx is not None and diff > 0:
+                        op_row = list(trade_cf[op_idx])
+                        reducible = min(diff, op_row[4])
+                        new_amt = max(0.0, op_row[4] - reducible)
+                        op_row[4] = truncate_amount(new_amt, ccy)
+                        diff -= reducible
+                        trade_cf[op_idx] = tuple(op_row)
+                        if op_row[4] <= 1e-12:
+                            trade_cf.pop(op_idx)
                     # diff가 남더라도 추가 조정 불필요 (운용자 입금 외에는 지침 없음)
                 ins_cf.extend(trade_cf)
 
@@ -668,8 +682,9 @@ def build_dividend_cashflows(
     total_amt: float,
     memo: str,
     pos_rec: pd.DataFrame,
-    op_id: Optional[int]
+    op_id: Optional[int],
 ) -> List[DividendCashflowRow]:
+) -> List[Dict[str, Any]]:
     if pos_rec.empty:
         return []
 
@@ -778,6 +793,21 @@ def build_dividend_cashflows(
                 source="DIVIDEND",
                 dividend_id=dividend_id,
             )
+    out_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        if abs(row["amount"]) <= 1e-12:
+            continue
+        out_rows.append(
+            {
+                "investor_id": row["investor_id"],
+                "dt": deal_dt.isoformat(),
+                "ccy": ccy,
+                "type": row["type"],
+                "amount": row["amount"],
+                "note": row.get("note", ""),
+                "source": "DIVIDEND",
+                "dividend_id": dividend_id,
+            }
         )
     return out_rows
 
@@ -1455,11 +1485,56 @@ with T5:
                         )
 
                         if rows_cf:
+                            expected_total = truncate_amount(total_amt, ccy_div)
+                            deposit_sum = sum(r[4] for r in rows_cf if r[3] == "DIVIDEND")
+                            round_diff = truncate_amount(expected_total - deposit_sum, ccy_div)
+
+                            if op_id and abs(round_diff) > 1e-8:
+                                if round_diff > 0:
+                                    rows_cf.append(
+                                        (
+                                            op_id,
+                                            deal_dt.isoformat(),
+                                            ccy_div,
+                                            "DIVIDEND_ROUND_ADJ",
+                                            truncate_amount(round_diff, ccy_div),
+                                            f"배당 반올림 조정 {symbol_div}",
+                                            "DIVIDEND",
+                                        )
+                                    )
+                                else:
+                                    diff = -round_diff  # deposit_sum > expected_total
+                                    for idx, row in enumerate(rows_cf):
+                                        if row[0] == op_id and row[3] == "MGMT_FEE_IN" and diff > 1e-8:
+                                            op_row = list(row)
+                                            reducible = min(diff, op_row[4])
+                                            new_amt = truncate_amount(op_row[4] - reducible, ccy_div)
+                                            diff -= reducible
+                                            if new_amt <= 1e-12:
+                                                rows_cf.pop(idx)
+                                            else:
+                                                op_row[4] = new_amt
+                                                rows_cf[idx] = tuple(op_row)
+                                            break
+                                    if diff > 1e-8:
+                                        rows_cf.append(
+                                            (
+                                                op_id,
+                                                deal_dt.isoformat(),
+                                                ccy_div,
+                                                "DIVIDEND_ROUND_ADJ",
+                                                truncate_amount(-diff, ccy_div),
+                                                f"배당 반올림 조정 {symbol_div}",
+                                                "DIVIDEND",
+                                            )
+                                        )
+
                             cur.executemany(
                                 """
                                 INSERT INTO cash_flows(
                                     investor_id, dt, ccy, type, amount, note, source, dividend_id
                                 ) VALUES (?,?,?,?,?,?,?,?)
+                                ) VALUES (:investor_id, :dt, :ccy, :type, :amount, :note, :source, :dividend_id)
                                 """,
                                 rows_cf,
                             )
