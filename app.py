@@ -831,10 +831,10 @@ with T3:
         else:
             qty_total = float(qty_input)
 
-        if side != "EDIT":
-            if (side == "BUY" and (total_amount <= 0 or qty_total <= 0)) or \
-               (side == "SELL" and (total_amount <= 0 or qty_total <= 0)):
-                st.error("주문 금액과 주식수를 입력하세요."); st.stop()
+        if side in ("BUY", "EDIT") and (total_amount <= 0 or qty_total <= 0):
+            st.error("주문 금액과 주식수를 입력하세요."); st.stop()
+        if side == "SELL" and (total_amount <= 0 or qty_total <= 0):
+            st.error("주문 금액과 주식수를 입력하세요."); st.stop()
 
         unit_price = float(total_amount) / float(qty_total) if qty_total > 0 else 0.0
 
@@ -883,9 +883,10 @@ with T3:
             )
             st.success("기록 완료"); _rr()
 
-        elif side in ("SELL","EDIT") and order_mode=="일반":
-            if total_pos_qty <= 0:
-                st.error("해당 종목 보유가 없습니다."); st.stop()
+        elif side == "EDIT" and order_mode=="일반":
+            st.error("개별 주문으로 변경해주세요."); st.stop()
+
+        elif side == "SELL" and order_mode=="일반":
             if qty_total - total_pos_qty > 1e-8:
                 st.error(f"매도 주식수({fmt_qty_2(qty_total)})가 전체 보유({fmt_qty_2(total_pos_qty)})를 초과합니다."); st.stop()
 
@@ -904,12 +905,12 @@ with T3:
                 side="SELL", dt=dtv, symbol=symbol.strip(), ccy=ccy,
                 total_qty=qty_total, price=unit_price,
                 alloc_amounts=alloc_amounts,
-                note=note if 'note' in locals() else "", edit_mode=(side=="EDIT"),
+                note=note if 'note' in locals() else "", edit_mode=False,
                 alloc_qtys=qty_by_investor
             )
             st.success("기록 완료"); _rr()
 
-        elif side in ("SELL","EDIT") and order_mode=="개별":
+        elif side == "SELL" and order_mode=="개별":
             iid = get_investor_id_by_name(st.session_state.get("order_ind_name"))
             if iid is None: st.error("투자자를 찾을 수 없습니다."); st.stop()
             if st.session_state.get("sell_all", False):
@@ -923,7 +924,21 @@ with T3:
                 side="SELL", dt=dtv, symbol=symbol.strip(), ccy=ccy,
                 total_qty=qty_total, price=unit_price,
                 alloc_amounts={iid: truncate_amount(total_amount, ccy)},
-                note=note if 'note' in locals() else "", edit_mode=(side=="EDIT"),
+                note=note if 'note' in locals() else "", edit_mode=False,
+                alloc_qtys={iid: qty_total}
+            )
+            st.success("기록 완료"); _rr()
+
+        elif side == "EDIT" and order_mode=="개별":
+            iid = get_investor_id_by_name(st.session_state.get("order_ind_name"))
+            if iid is None: st.error("투자자를 찾을 수 없습니다."); st.stop()
+            if unit_price <= 0:
+                st.error("주문 금액/주식수가 유효하지 않습니다."); st.stop()
+            record_trade(
+                side="BUY", dt=dtv, symbol=symbol.strip(), ccy=ccy,
+                total_qty=qty_total, price=unit_price,
+                alloc_amounts={iid: truncate_amount(total_amount, ccy)},
+                note=note if 'note' in locals() else "", edit_mode=True,
                 alloc_qtys={iid: qty_total}
             )
             st.success("기록 완료"); _rr()
