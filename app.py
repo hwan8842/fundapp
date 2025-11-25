@@ -1633,6 +1633,8 @@ with T8:
         if bal_df.empty:
             st.info("표시할 예수금이 없습니다.")
         else:
+            bal_df["현재 예수금"] = bal_df["현재 예수금"].apply(_to_float_safe)
+            bal_df["investor_id"] = bal_df["investor_id"].apply(lambda x: int(_to_float_safe(x)))
             edited_bal = st.data_editor(
                 bal_df[["투자자", "통화", "현재 예수금", "investor_id"]],
                 key="cash_balance_editor",
