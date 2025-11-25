@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple, Optional
 import json, math, time
 import numpy as np
 import altair as alt
+import re
 
 # ==============================
 # Globals & Constants
@@ -514,7 +515,7 @@ def rebuild_trade_effects(from_dt: Optional[str] = None):
                     ins_rp
                 )
 
-    prefee_map_all.clear(); investor_positions.clear(); investor_balances.clear(); load_df.clear()
+    prefee_map_all.clear(); investor_positions.clear(); load_df.clear()
 
 # ==============================
 # Aggregations (Cached)
@@ -558,7 +559,6 @@ def investor_positions() -> pd.DataFrame:
             })
     return pd.DataFrame(rows, columns=["investor_id","name","symbol","ccy","qty","avg_px","cost_basis"])
 
-@st.cache_data(show_spinner=False)
 def investor_balances(ccy: str = "KRW") -> pd.DataFrame:
     with get_conn() as conn:
         return pd.read_sql_query("""
@@ -571,6 +571,20 @@ def investor_balances(ccy: str = "KRW") -> pd.DataFrame:
           GROUP BY inv.id, inv.name
           ORDER BY inv.name
         """, conn, params=(ccy,))
+
+
+def total_cash_snapshot() -> Dict[str, float]:
+    """Return latest cash totals per 통화 directly from DB to align dashboard with 원장."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+          SELECT cf.ccy,
+                 COALESCE(SUM(CASE
+                   WHEN cf.type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN') THEN cf.amount
+                   WHEN cf.type IN ('WITHDRAW','MGMT_FEE_OUT') THEN -cf.amount ELSE 0 END), 0.0) as cash
+          FROM cash_flows cf
+          GROUP BY cf.ccy
+        """).fetchall()
+    return {r[0]: float(r[1] or 0.0) for r in rows}
 
 @st.cache_data(show_spinner=False)
 def prefee_map_all() -> Dict[Tuple[int,int], float]:
@@ -611,9 +625,9 @@ T1, T2, T3, T4, T5, T6, T7, T8 = st.tabs([
 # ==============================
 with T1:
     st.subheader("요약")
-    krw_df = investor_balances("KRW"); usd_df = investor_balances("USD")
-    krw_cash = float(krw_df["cash"].sum() if not krw_df.empty else 0.0)
-    usd_cash = float(usd_df["cash"].sum() if not usd_df.empty else 0.0)
+    cash_map = total_cash_snapshot()
+    krw_cash = float(cash_map.get("KRW", 0.0))
+    usd_cash = float(cash_map.get("USD", 0.0))
 
     pos_all = investor_positions()
     inv_sum_ccy = pos_all.groupby("ccy")["cost_basis"].sum() if not pos_all.empty else pd.Series(dtype=float)
@@ -660,7 +674,7 @@ with T2:
         if ok:
             iid = get_investor_id_by_name(sel_name)
             add_cashflow_retry(iid, dt_cf, sel_ccy, io_type, amt, note if 'note' in locals() else "", source="MANUAL")
-            prefee_map_all.clear(); investor_positions.clear(); investor_balances.clear(); load_df.clear()
+            prefee_map_all.clear(); investor_positions.clear(); load_df.clear()
             st.success("기록 완료"); _rr()
 
     st.markdown("### 최근입출금")
@@ -735,7 +749,7 @@ with T2:
                             cur.execute("UPDATE cash_flows SET dt=?, ccy=?, type=?, amount=?, note=? WHERE id=?",
                                         (row["dt"], row["ccy"], row["type"], float(row["amount"]), row["note"], int(rid)))
                         conn.commit()
-                    prefee_map_all.clear(); investor_positions.clear(); investor_balances.clear(); load_df.clear()
+                    prefee_map_all.clear(); investor_positions.clear(); load_df.clear()
                     st.success(f"{len(changed_ids)}건 저장 완료"); _rr()
                 else:
                     st.info("변경사항이 없습니다.")
@@ -785,9 +799,10 @@ with T3:
         if order_mode == "개별":
             sel_name_ind = st.selectbox("개별 투자자", inv_all_df["name"].tolist(), key="order_ind_name")
 
-        # SELL/EDIT일 때만 100% 매도
-        is_sell_like = (side in ("SELL","EDIT"))
-        if not is_sell_like and st.session_state.get("sell_all", False):
+        # SELL/EDIT 외 모드에서도 체크박스는 노출하되 BUY에서는 안내 처리
+        is_sell_like = (side == "SELL")
+        if side == "BUY" and st.session_state.get("sell_all", False):
+            st.warning("매수 주문이라 이용 불가능합니다.")
             st.session_state["sell_all"] = False
 
         # 4행: 주문 금액 / 주식수 / 100% 매도
@@ -800,16 +815,18 @@ with T3:
             qty_input = st.number_input(
                 "주식수",
                 min_value=0.0, step=0.00001, format="%.5f",
-                disabled=(is_sell_like and st.session_state.get("sell_all", False))
             )
 
         with c_full:
             sell_all = st.checkbox(
                 "100% 매도",
                 value=st.session_state.get("sell_all", False),
-                disabled=not is_sell_like,
                 key="sell_all"
             )
+            if side == "BUY" and sell_all:
+                st.warning("매수 주문이라 이용 불가능합니다.")
+                st.session_state["sell_all"] = False
+                sell_all = False
 
         # 5행: 비고 + 기록
         with st.expander("비고", expanded=False):
@@ -827,10 +844,10 @@ with T3:
         else:
             qty_total = float(qty_input)
 
-        if side != "EDIT":
-            if (side == "BUY" and (total_amount <= 0 or qty_total <= 0)) or \
-               (side == "SELL" and (total_amount <= 0 or qty_total <= 0)):
-                st.error("주문 금액과 주식수를 입력하세요."); st.stop()
+        if side in ("BUY", "EDIT") and (total_amount <= 0 or qty_total <= 0):
+            st.error("주문 금액과 주식수를 입력하세요."); st.stop()
+        if side == "SELL" and (total_amount <= 0 or qty_total <= 0):
+            st.error("주문 금액과 주식수를 입력하세요."); st.stop()
 
         unit_price = float(total_amount) / float(qty_total) if qty_total > 0 else 0.0
 
@@ -879,9 +896,10 @@ with T3:
             )
             st.success("기록 완료"); _rr()
 
-        elif side in ("SELL","EDIT") and order_mode=="일반":
-            if total_pos_qty <= 0:
-                st.error("해당 종목 보유가 없습니다."); st.stop()
+        elif side == "EDIT" and order_mode=="일반":
+            st.error("개별 주문으로 변경해주세요."); st.stop()
+
+        elif side == "SELL" and order_mode=="일반":
             if qty_total - total_pos_qty > 1e-8:
                 st.error(f"매도 주식수({fmt_qty_2(qty_total)})가 전체 보유({fmt_qty_2(total_pos_qty)})를 초과합니다."); st.stop()
 
@@ -900,12 +918,12 @@ with T3:
                 side="SELL", dt=dtv, symbol=symbol.strip(), ccy=ccy,
                 total_qty=qty_total, price=unit_price,
                 alloc_amounts=alloc_amounts,
-                note=note if 'note' in locals() else "", edit_mode=(side=="EDIT"),
+                note=note if 'note' in locals() else "", edit_mode=False,
                 alloc_qtys=qty_by_investor
             )
             st.success("기록 완료"); _rr()
 
-        elif side in ("SELL","EDIT") and order_mode=="개별":
+        elif side == "SELL" and order_mode=="개별":
             iid = get_investor_id_by_name(st.session_state.get("order_ind_name"))
             if iid is None: st.error("투자자를 찾을 수 없습니다."); st.stop()
             if st.session_state.get("sell_all", False):
@@ -919,7 +937,21 @@ with T3:
                 side="SELL", dt=dtv, symbol=symbol.strip(), ccy=ccy,
                 total_qty=qty_total, price=unit_price,
                 alloc_amounts={iid: truncate_amount(total_amount, ccy)},
-                note=note if 'note' in locals() else "", edit_mode=(side=="EDIT"),
+                note=note if 'note' in locals() else "", edit_mode=False,
+                alloc_qtys={iid: qty_total}
+            )
+            st.success("기록 완료"); _rr()
+
+        elif side == "EDIT" and order_mode=="개별":
+            iid = get_investor_id_by_name(st.session_state.get("order_ind_name"))
+            if iid is None: st.error("투자자를 찾을 수 없습니다."); st.stop()
+            if unit_price <= 0:
+                st.error("주문 금액/주식수가 유효하지 않습니다."); st.stop()
+            record_trade(
+                side="BUY", dt=dtv, symbol=symbol.strip(), ccy=ccy,
+                total_qty=qty_total, price=unit_price,
+                alloc_amounts={iid: truncate_amount(total_amount, ccy)},
+                note=note if 'note' in locals() else "", edit_mode=True,
                 alloc_qtys={iid: qty_total}
             )
             st.success("기록 완료"); _rr()
@@ -1047,7 +1079,7 @@ with T3:
 
                 if (updated_it > 0) or (updated_trades > 0):
                     rebuild_trade_effects(from_dt=None)
-                prefee_map_all.clear(); investor_positions.clear(); investor_balances.clear(); load_df.clear()
+                prefee_map_all.clear(); investor_positions.clear(); load_df.clear()
                 st.success(f"거래 {updated_trades}건 날짜 변경, 원장 {updated_it}건 저장 완료"); _rr()
         with c2:
             if st.button("새로고침", key="it_recent_like_reload"): _rr()
@@ -1224,7 +1256,6 @@ with T5:
 
                     prefee_map_all.clear();
                     investor_positions.clear();
-                    investor_balances.clear();
                     load_df.clear()
                     st.success("배당 분배 완료");
                     _rr()
@@ -1232,17 +1263,72 @@ with T5:
 
     st.markdown("### 최근 배당 분배 내역")
     div_recent = load_df("""
-        SELECT cf.dt AS 일자, inv.name AS 투자자, cf.ccy AS 통화, cf.type AS 유형, cf.amount AS 금액, cf.note AS 비고
-        FROM cash_flows cf
-        JOIN investors inv ON inv.id = cf.investor_id
-        WHERE cf.source='DIVIDEND'
-        ORDER BY date(cf.dt) DESC, cf.id DESC
+        SELECT base.일자,
+               base.투자자,
+               base.통화,
+               base.금액,
+               base.last_cf_id,
+               base.div_note,
+               base.fee_out_note,
+               base.fee_in_note,
+               div.symbol AS div_symbol
+        FROM (
+            SELECT cf.dt AS 일자,
+                   inv.name AS 투자자,
+                   cf.ccy AS 통화,
+                   SUM(CASE
+                           WHEN cf.type IN ('DIVIDEND', 'MGMT_FEE_IN') THEN cf.amount
+                           WHEN cf.type = 'MGMT_FEE_OUT' THEN -cf.amount
+                           ELSE 0
+                       END) AS 금액,
+                   MAX(cf.id) AS last_cf_id,
+                   MAX(CASE WHEN cf.type = 'DIVIDEND' THEN cf.note END) AS div_note,
+                   MAX(CASE WHEN cf.type = 'MGMT_FEE_OUT' THEN cf.note END) AS fee_out_note,
+                   MAX(CASE WHEN cf.type = 'MGMT_FEE_IN' THEN cf.note END) AS fee_in_note
+            FROM cash_flows cf
+            JOIN investors inv ON inv.id = cf.investor_id
+            WHERE cf.source='DIVIDEND'
+            GROUP BY cf.dt, cf.investor_id, inv.name, cf.ccy
+        ) AS base
+        LEFT JOIN dividends div
+               ON div.dt = base.일자
+              AND div.ccy = base.통화
+              AND ((div.note IS NULL AND base.div_note IS NULL)
+                   OR (div.note = base.div_note))
+        ORDER BY date(base.일자) DESC, base.last_cf_id DESC
         LIMIT 200
     """)
     if div_recent.empty:
         st.info("최근 배당 분배 내역이 없습니다.")
     else:
-        div_recent_fmt = apply_row_ccy_format(div_recent.copy(), "통화", [], [], ["금액"])
+        def _extract_symbol(notes: List[Optional[str]], fallback: Optional[str]) -> str:
+            for note in notes:
+                if not note or not isinstance(note, str):
+                    continue
+                match = re.search(r"배당\s+([^\s()]+)", note)
+                if match:
+                    return match.group(1)
+                match = re.search(r"성과수수료(?:\s+합계)?\s+([^\s()]+)", note)
+                if match:
+                    return match.group(1)
+            if fallback and isinstance(fallback, str):
+                return fallback
+            return ""
+
+        div_recent["종목명"] = div_recent.apply(
+            lambda row: _extract_symbol([
+                row.get("div_note"),
+                row.get("fee_out_note"),
+                row.get("fee_in_note"),
+            ], row.get("div_symbol")),
+            axis=1,
+        )
+        div_recent["비고"] = ""
+        div_recent = div_recent.drop(columns=["div_note", "fee_out_note", "fee_in_note", "div_symbol"], errors="ignore")
+        div_recent_fmt = apply_row_ccy_format(
+            div_recent[["일자", "투자자", "통화", "종목명", "금액", "비고"]].copy(),
+            "통화", [], [], ["금액"]
+        )
         try: div_recent_fmt["일자"] = pd.to_datetime(div_recent_fmt["일자"], errors="coerce").dt.date
         except: pass
         st.dataframe(div_recent_fmt, use_container_width=True)
@@ -1341,31 +1427,86 @@ with T7:
         with c1: p_start = st.date_input("시작일", value=today - timedelta(days=30), key="pnl_start")
         with c2: p_end   = st.date_input("종료일", value=today, key="pnl_end")
 
-    pnl = load_df("""
-      SELECT rp.investor_id, inv.name AS 투자자, rp.ccy AS 통화, rp.amount AS 차익, t.dt AS 일자
+    inv_df = list_investors()
+    inv_choices = ["전체"]
+    inv_map = {"전체": None}
+    if not inv_df.empty:
+        for _, row in inv_df.iterrows():
+            name = row.get("name")
+            if not isinstance(name, str):
+                continue
+            inv_choices.append(name)
+            inv_map[name] = int(row.get("id"))
+    selected_inv = st.selectbox("투자자", options=inv_choices, index=0)
+    selected_inv_id = inv_map.get(selected_inv)
+
+    pnl_query = """
+      SELECT rp.investor_id, inv.name AS 투자자, rp.ccy AS 통화, rp.amount AS 차익
       FROM realized_pnl rp
       JOIN investors inv ON inv.id = rp.investor_id
       JOIN trades t ON t.id = rp.trade_id
       WHERE date(t.dt) BETWEEN date(?) AND date(?)
-      ORDER BY date(t.dt) DESC, rp.investor_id
-    """, params=(p_start.isoformat(), p_end.isoformat()))
-    if pnl.empty:
-        st.info("해당 기간 실현 차익 데이터가 없습니다.")
-    else:
-        try: pnl["일자"] = pd.to_datetime(pnl["일자"], errors="coerce").dt.date
-        except: pass
-        st.markdown("#### 투자자별 실현 차익")
-        agg_inv = pnl.groupby(["투자자","통화"], as_index=False)["차익"].sum()
-        def _fmt_row(row):
-            return fmt_by_ccy(row["차익"], row["통화"], "amount")
-        show_inv = agg_inv.copy()
-        show_inv["차익"] = show_inv.apply(_fmt_row, axis=1)
-        st.dataframe(show_inv, use_container_width=True)
+    """
+    pnl_params: List = [p_start.isoformat(), p_end.isoformat()]
+    if selected_inv_id is not None:
+        pnl_query += " AND rp.investor_id = ?"
+        pnl_params.append(selected_inv_id)
+    pnl_query += " ORDER BY date(t.dt) DESC, rp.investor_id"
+    pnl = load_df(pnl_query, params=tuple(pnl_params))
 
-        st.markdown("#### 거래별 실현 차익 (상세)")
-        show_tx = pnl.copy()
-        show_tx["표시 차익"] = show_tx.apply(lambda r: fmt_by_ccy(r["차익"], r["통화"], "amount"), axis=1)
-        st.dataframe(show_tx[["일자","투자자","통화","표시 차익"]], use_container_width=True)
+    div_query = """
+      SELECT inv.name AS 투자자, cf.ccy AS 통화,
+             SUM(CASE
+                     WHEN cf.type IN ('DIVIDEND','MGMT_FEE_IN') THEN cf.amount
+                     WHEN cf.type = 'MGMT_FEE_OUT' THEN -cf.amount
+                     ELSE 0
+                 END) AS dividend_income
+      FROM cash_flows cf
+      JOIN investors inv ON inv.id = cf.investor_id
+      WHERE cf.source = 'DIVIDEND'
+        AND date(cf.dt) BETWEEN date(?) AND date(?)
+    """
+    div_params: List = [p_start.isoformat(), p_end.isoformat()]
+    if selected_inv_id is not None:
+        div_query += " AND cf.investor_id = ?"
+        div_params.append(selected_inv_id)
+    div_query += " GROUP BY inv.name, cf.ccy"
+    div_df_raw = load_df(div_query, params=tuple(div_params))
+    div_df = (div_df_raw.rename(columns={"dividend_income": "배당 수익"})
+              if not div_df_raw.empty else pd.DataFrame(columns=["투자자", "통화", "배당 수익"]))
+
+    agg_inv = (pnl.groupby(["투자자", "통화"], as_index=False)["차익"].sum()
+               if not pnl.empty else pd.DataFrame(columns=["투자자", "통화", "차익"]))
+
+    combined = pd.merge(
+        agg_inv,
+        div_df,
+        on=["투자자", "통화"],
+        how="outer"
+    )
+
+    if combined.empty:
+        st.info("해당 기간 수익 데이터가 없습니다.")
+    else:
+        if "차익" not in combined.columns:
+            combined["차익"] = 0.0
+        if "배당 수익" not in combined.columns:
+            combined["배당 수익"] = 0.0
+        combined[["차익", "배당 수익"]] = combined[["차익", "배당 수익"]].fillna(0.0)
+        show_inv = combined.sort_values(["투자자", "통화"]).reset_index(drop=True)
+        for col in ["차익", "배당 수익"]:
+            show_inv[col] = show_inv.apply(lambda r: fmt_by_ccy(r[col], r["통화"], "amount"), axis=1)
+        st.markdown("#### 투자자별 실현 차익")
+        st.dataframe(
+            show_inv,
+            use_container_width=True,
+            column_config={
+                "투자자": st.column_config.TextColumn("투자자", width=200),
+                "통화": st.column_config.TextColumn("통화", width=80),
+                "차익": st.column_config.TextColumn("차익", width=160),
+                "배당 수익": st.column_config.TextColumn("배당 수익", width=160),
+            },
+        )
 
 # ==============================
 # Admin / Delete
@@ -1464,10 +1605,73 @@ with T8:
                 st.warning("삭제할 행을 선택하세요.")
             else:
                 cnt = delete_cb(ids)
-                prefee_map_all.clear(); investor_positions.clear(); investor_balances.clear(); load_df.clear()
+                prefee_map_all.clear(); investor_positions.clear(); load_df.clear()
                 st.success(f"{cnt}건 삭제 완료"); _rr()
 
     with tabA:
+        st.markdown("##### 데이터베이스 예수금 현황/수정")
+        adj_col1, adj_col2 = st.columns([1, 2])
+        with adj_col1:
+            adj_dt = st.date_input("조정 일자", value=date.today(), key="cash_adj_date")
+        with adj_col2:
+            adj_note = st.text_input("조정 비고", value="예수금 조정", key="cash_adj_note")
+
+        bal_rows: List[Dict] = []
+        for ccy in SUPPORTED_CCY:
+            cur_bal = investor_balances(ccy)
+            if cur_bal.empty:
+                continue
+            cur_bal = cur_bal.rename(columns={"name": "투자자", "cash": "현재 예수금"})
+            cur_bal["통화"] = ccy
+            cur_bal["새 예수금"] = cur_bal["현재 예수금"]
+            bal_rows.append(cur_bal)
+
+        bal_df = pd.concat(bal_rows, ignore_index=True) if bal_rows else pd.DataFrame(columns=["투자자","investor_id","현재 예수금","통화","새 예수금"])
+        if bal_df.empty:
+            st.info("표시할 예수금이 없습니다.")
+        else:
+            edited_bal = st.data_editor(
+                bal_df[["투자자", "통화", "현재 예수금", "새 예수금", "investor_id"]],
+                key="cash_balance_editor",
+                hide_index=True,
+                use_container_width=True,
+                disabled=["투자자", "통화", "현재 예수금", "investor_id"],
+                column_config={
+                    "투자자": st.column_config.TextColumn("투자자", width=180),
+                    "통화": st.column_config.TextColumn("통화", width=80),
+                    "현재 예수금": st.column_config.NumberColumn("현재 예수금", format=",.2f"),
+                    "새 예수금": st.column_config.NumberColumn("새 예수금", format=",.2f"),
+                },
+            )
+
+            if st.button("예수금 변경 저장", key="cash_balance_save"):
+                changes = []
+                if isinstance(edited_bal, pd.DataFrame):
+                    for _, r in edited_bal.iterrows():
+                        new_amt = _to_float_safe(r.get("새 예수금", 0.0))
+                        cur_amt = _to_float_safe(r.get("현재 예수금", 0.0))
+                        delta = truncate_amount(new_amt - cur_amt, str(r.get("통화")))
+                        if abs(delta) <= 1e-9:
+                            continue
+                        iid = int(r.get("investor_id"))
+                        ccy = str(r.get("통화"))
+                        cf_type = "DEPOSIT" if delta > 0 else "WITHDRAW"
+                        add_cashflow_retry(
+                            investor_id=iid,
+                            dt=adj_dt,
+                            ccy=ccy,
+                            type_=cf_type,
+                            amount=abs(delta),
+                            note=f"⚙️ {adj_note}",
+                            source="MANUAL",
+                        )
+                        changes.append((r.get("투자자"), ccy, delta))
+                prefee_map_all.clear(); investor_positions.clear(); load_df.clear()
+                if changes:
+                    st.success(f"{len(changes)}건 조정 완료"); _rr()
+                else:
+                    st.info("변경된 예수금이 없습니다.")
+
         df = load_df("""
           SELECT cf.id as id, cf.dt as 일자, inv.name as 투자자, cf.ccy as 통화, cf.type as 유형,
                  cf.amount as 금액, cf.note as 비고, cf.source as 출처
@@ -1497,7 +1701,7 @@ with T8:
                         cur.execute("DELETE FROM realized_pnl WHERE trade_id NOT IN (SELECT id FROM trades)")
                         conn.commit()
                     rebuild_trade_effects(from_dt=None)
-                prefee_map_all.clear(); investor_positions.clear(); investor_balances.clear(); load_df.clear()
+                prefee_map_all.clear(); investor_positions.clear(); load_df.clear()
                 st.success("기간 내 거래 삭제 완료"); _rr()
 
         df = load_df("""
