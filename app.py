@@ -1609,6 +1609,69 @@ with T8:
                 st.success(f"{cnt}건 삭제 완료"); _rr()
 
     with tabA:
+        st.markdown("##### 데이터베이스 예수금 현황/수정")
+        adj_col1, adj_col2 = st.columns([1, 2])
+        with adj_col1:
+            adj_dt = st.date_input("조정 일자", value=date.today(), key="cash_adj_date")
+        with adj_col2:
+            adj_note = st.text_input("조정 비고", value="예수금 조정", key="cash_adj_note")
+
+        bal_rows: List[Dict] = []
+        for ccy in SUPPORTED_CCY:
+            cur_bal = investor_balances(ccy)
+            if cur_bal.empty:
+                continue
+            cur_bal = cur_bal.rename(columns={"name": "투자자", "cash": "현재 예수금"})
+            cur_bal["통화"] = ccy
+            cur_bal["새 예수금"] = cur_bal["현재 예수금"]
+            bal_rows.append(cur_bal)
+
+        bal_df = pd.concat(bal_rows, ignore_index=True) if bal_rows else pd.DataFrame(columns=["투자자","investor_id","현재 예수금","통화","새 예수금"])
+        if bal_df.empty:
+            st.info("표시할 예수금이 없습니다.")
+        else:
+            edited_bal = st.data_editor(
+                bal_df[["투자자", "통화", "현재 예수금", "새 예수금", "investor_id"]],
+                key="cash_balance_editor",
+                hide_index=True,
+                use_container_width=True,
+                disabled=["투자자", "통화", "현재 예수금", "investor_id"],
+                column_config={
+                    "투자자": st.column_config.TextColumn("투자자", width=180),
+                    "통화": st.column_config.TextColumn("통화", width=80),
+                    "현재 예수금": st.column_config.NumberColumn("현재 예수금", format=",.2f"),
+                    "새 예수금": st.column_config.NumberColumn("새 예수금", format=",.2f"),
+                },
+            )
+
+            if st.button("예수금 변경 저장", key="cash_balance_save"):
+                changes = []
+                if isinstance(edited_bal, pd.DataFrame):
+                    for _, r in edited_bal.iterrows():
+                        new_amt = _to_float_safe(r.get("새 예수금", 0.0))
+                        cur_amt = _to_float_safe(r.get("현재 예수금", 0.0))
+                        delta = truncate_amount(new_amt - cur_amt, str(r.get("통화")))
+                        if abs(delta) <= 1e-9:
+                            continue
+                        iid = int(r.get("investor_id"))
+                        ccy = str(r.get("통화"))
+                        cf_type = "DEPOSIT" if delta > 0 else "WITHDRAW"
+                        add_cashflow_retry(
+                            investor_id=iid,
+                            dt=adj_dt,
+                            ccy=ccy,
+                            type_=cf_type,
+                            amount=abs(delta),
+                            note=f"⚙️ {adj_note}",
+                            source="MANUAL",
+                        )
+                        changes.append((r.get("투자자"), ccy, delta))
+                prefee_map_all.clear(); investor_positions.clear(); load_df.clear()
+                if changes:
+                    st.success(f"{len(changes)}건 조정 완료"); _rr()
+                else:
+                    st.info("변경된 예수금이 없습니다.")
+
         df = load_df("""
           SELECT cf.id as id, cf.dt as 일자, inv.name as 투자자, cf.ccy as 통화, cf.type as 유형,
                  cf.amount as 금액, cf.note as 비고, cf.source as 출처
