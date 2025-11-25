@@ -515,7 +515,7 @@ def rebuild_trade_effects(from_dt: Optional[str] = None):
                     ins_rp
                 )
 
-    prefee_map_all.clear(); investor_positions.clear(); investor_balances.clear(); load_df.clear()
+    prefee_map_all.clear(); investor_positions.clear(); load_df.clear()
 
 # ==============================
 # Aggregations (Cached)
@@ -559,7 +559,6 @@ def investor_positions() -> pd.DataFrame:
             })
     return pd.DataFrame(rows, columns=["investor_id","name","symbol","ccy","qty","avg_px","cost_basis"])
 
-@st.cache_data(show_spinner=False)
 def investor_balances(ccy: str = "KRW") -> pd.DataFrame:
     with get_conn() as conn:
         return pd.read_sql_query("""
@@ -572,6 +571,20 @@ def investor_balances(ccy: str = "KRW") -> pd.DataFrame:
           GROUP BY inv.id, inv.name
           ORDER BY inv.name
         """, conn, params=(ccy,))
+
+
+def total_cash_snapshot() -> Dict[str, float]:
+    """Return latest cash totals per 통화 directly from DB to align dashboard with 원장."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+          SELECT cf.ccy,
+                 COALESCE(SUM(CASE
+                   WHEN cf.type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN') THEN cf.amount
+                   WHEN cf.type IN ('WITHDRAW','MGMT_FEE_OUT') THEN -cf.amount ELSE 0 END), 0.0) as cash
+          FROM cash_flows cf
+          GROUP BY cf.ccy
+        """).fetchall()
+    return {r[0]: float(r[1] or 0.0) for r in rows}
 
 @st.cache_data(show_spinner=False)
 def prefee_map_all() -> Dict[Tuple[int,int], float]:
@@ -612,9 +625,9 @@ T1, T2, T3, T4, T5, T6, T7, T8 = st.tabs([
 # ==============================
 with T1:
     st.subheader("요약")
-    krw_df = investor_balances("KRW"); usd_df = investor_balances("USD")
-    krw_cash = float(krw_df["cash"].sum() if not krw_df.empty else 0.0)
-    usd_cash = float(usd_df["cash"].sum() if not usd_df.empty else 0.0)
+    cash_map = total_cash_snapshot()
+    krw_cash = float(cash_map.get("KRW", 0.0))
+    usd_cash = float(cash_map.get("USD", 0.0))
 
     pos_all = investor_positions()
     inv_sum_ccy = pos_all.groupby("ccy")["cost_basis"].sum() if not pos_all.empty else pd.Series(dtype=float)
@@ -661,7 +674,7 @@ with T2:
         if ok:
             iid = get_investor_id_by_name(sel_name)
             add_cashflow_retry(iid, dt_cf, sel_ccy, io_type, amt, note if 'note' in locals() else "", source="MANUAL")
-            prefee_map_all.clear(); investor_positions.clear(); investor_balances.clear(); load_df.clear()
+            prefee_map_all.clear(); investor_positions.clear(); load_df.clear()
             st.success("기록 완료"); _rr()
 
     st.markdown("### 최근입출금")
@@ -736,7 +749,7 @@ with T2:
                             cur.execute("UPDATE cash_flows SET dt=?, ccy=?, type=?, amount=?, note=? WHERE id=?",
                                         (row["dt"], row["ccy"], row["type"], float(row["amount"]), row["note"], int(rid)))
                         conn.commit()
-                    prefee_map_all.clear(); investor_positions.clear(); investor_balances.clear(); load_df.clear()
+                    prefee_map_all.clear(); investor_positions.clear(); load_df.clear()
                     st.success(f"{len(changed_ids)}건 저장 완료"); _rr()
                 else:
                     st.info("변경사항이 없습니다.")
@@ -1066,7 +1079,7 @@ with T3:
 
                 if (updated_it > 0) or (updated_trades > 0):
                     rebuild_trade_effects(from_dt=None)
-                prefee_map_all.clear(); investor_positions.clear(); investor_balances.clear(); load_df.clear()
+                prefee_map_all.clear(); investor_positions.clear(); load_df.clear()
                 st.success(f"거래 {updated_trades}건 날짜 변경, 원장 {updated_it}건 저장 완료"); _rr()
         with c2:
             if st.button("새로고침", key="it_recent_like_reload"): _rr()
@@ -1243,7 +1256,6 @@ with T5:
 
                     prefee_map_all.clear();
                     investor_positions.clear();
-                    investor_balances.clear();
                     load_df.clear()
                     st.success("배당 분배 완료");
                     _rr()
@@ -1593,7 +1605,7 @@ with T8:
                 st.warning("삭제할 행을 선택하세요.")
             else:
                 cnt = delete_cb(ids)
-                prefee_map_all.clear(); investor_positions.clear(); investor_balances.clear(); load_df.clear()
+                prefee_map_all.clear(); investor_positions.clear(); load_df.clear()
                 st.success(f"{cnt}건 삭제 완료"); _rr()
 
     with tabA:
@@ -1626,7 +1638,7 @@ with T8:
                         cur.execute("DELETE FROM realized_pnl WHERE trade_id NOT IN (SELECT id FROM trades)")
                         conn.commit()
                     rebuild_trade_effects(from_dt=None)
-                prefee_map_all.clear(); investor_positions.clear(); investor_balances.clear(); load_df.clear()
+                prefee_map_all.clear(); investor_positions.clear(); load_df.clear()
                 st.success("기간 내 거래 삭제 완료"); _rr()
 
         df = load_df("""
