@@ -1617,6 +1617,7 @@ with T8:
             adj_note = st.text_input("조정 비고", value="예수금 조정", key="cash_adj_note")
 
         bal_rows: List[Dict] = []
+        orig_bal_map: Dict[Tuple[int, str], float] = {}
         for ccy in SUPPORTED_CCY:
             cur_bal = investor_balances(ccy)
             if cur_bal.empty:
@@ -1624,24 +1625,25 @@ with T8:
             cur_bal = cur_bal.rename(columns={"name": "투자자", "cash": "현재 예수금"})
             cur_bal["현재 예수금"] = pd.to_numeric(cur_bal["현재 예수금"], errors="coerce").fillna(0.0)
             cur_bal["통화"] = ccy
-            cur_bal["새 예수금"] = cur_bal["현재 예수금"]
+            for _, r in cur_bal.iterrows():
+                orig_bal_map[(int(r["investor_id"]), ccy)] = float(r["현재 예수금"])
             bal_rows.append(cur_bal)
 
-        bal_df = pd.concat(bal_rows, ignore_index=True) if bal_rows else pd.DataFrame(columns=["투자자","investor_id","현재 예수금","통화","새 예수금"])
+        bal_df = pd.concat(bal_rows, ignore_index=True) if bal_rows else pd.DataFrame(columns=["투자자","investor_id","현재 예수금","통화"])
         if bal_df.empty:
             st.info("표시할 예수금이 없습니다.")
         else:
             edited_bal = st.data_editor(
-                bal_df[["투자자", "통화", "현재 예수금", "새 예수금", "investor_id"]],
+                bal_df[["투자자", "통화", "현재 예수금", "investor_id"]],
                 key="cash_balance_editor",
                 hide_index=True,
                 use_container_width=True,
-                disabled=["투자자", "통화", "현재 예수금", "investor_id"],
+                disabled=["투자자", "통화", "investor_id"],
                 column_config={
                     "투자자": st.column_config.TextColumn("투자자", width=180),
                     "통화": st.column_config.TextColumn("통화", width=80),
                     "현재 예수금": st.column_config.NumberColumn("현재 예수금", format=",.2f"),
-                    "새 예수금": st.column_config.NumberColumn("새 예수금", format=",.2f"),
+                    "investor_id": st.column_config.NumberColumn("investor_id", width=1, help="내부용"),
                 },
             )
 
@@ -1649,13 +1651,13 @@ with T8:
                 changes = []
                 if isinstance(edited_bal, pd.DataFrame):
                     for _, r in edited_bal.iterrows():
-                        new_amt = _to_float_safe(r.get("새 예수금", 0.0))
-                        cur_amt = _to_float_safe(r.get("현재 예수금", 0.0))
+                        iid = int(r.get("investor_id"))
+                        ccy = str(r.get("통화"))
+                        cur_amt = orig_bal_map.get((iid, ccy), 0.0)
+                        new_amt = _to_float_safe(r.get("현재 예수금", 0.0))
                         delta = truncate_amount(new_amt - cur_amt, str(r.get("통화")))
                         if abs(delta) <= 1e-9:
                             continue
-                        iid = int(r.get("investor_id"))
-                        ccy = str(r.get("통화"))
                         cf_type = "DEPOSIT" if delta > 0 else "WITHDRAW"
                         add_cashflow_retry(
                             investor_id=iid,
