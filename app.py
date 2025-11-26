@@ -1167,10 +1167,25 @@ with T4:
     st.markdown("#### 잔고(예수금)")
     bal_krw = investor_balances("KRW").rename(columns={"name":"투자자","cash":"KRW 예수금"})[["투자자","KRW 예수금"]]
     bal_usd = investor_balances("USD").rename(columns={"name":"투자자","cash":"USD 예수금"})[["투자자","USD 예수금"]]
+    dep_krw = load_df(
+        """
+          SELECT inv.name AS 투자자, SUM(cf.amount) AS 총입금(KRW)
+          FROM cash_flows cf
+          JOIN investors inv ON inv.id = cf.investor_id
+          WHERE cf.type='DEPOSIT' AND cf.ccy='KRW'
+          GROUP BY cf.investor_id
+        """
+    )
     bal = pd.merge(bal_krw, bal_usd, on="투자자", how="outer").fillna(0)
+    if not dep_krw.empty:
+        dep_krw["총입금(KRW)"] = dep_krw["총입금(KRW)"].apply(_to_float_safe)
+        bal = bal.merge(dep_krw[["투자자", "총입금(KRW)"]], on="투자자", how="left")
     if not bal.empty:
-        bal["KRW 예수금"] = bal["KRW 예수금"].map(lambda x: fmt_by_ccy(x, "KRW", "amount"))
-        bal["USD 예수금"] = bal["USD 예수금"].map(lambda x: fmt_by_ccy(x, "USD", "amount"))
+        for col, ccy in [("KRW 예수금", "KRW"), ("USD 예수금", "USD")]:
+            if col in bal.columns:
+                bal[col] = bal[col].fillna(0).map(lambda x: fmt_by_ccy(x, ccy, "amount"))
+        if "총입금(KRW)" in bal.columns:
+            bal["총입금(KRW)"] = bal["총입금(KRW)"].fillna(0).map(lambda x: fmt_by_ccy(x, "KRW", "amount"))
     st.dataframe(bal, use_container_width=True)
 
 # ==============================
