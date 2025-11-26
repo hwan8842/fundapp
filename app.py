@@ -1108,26 +1108,14 @@ with T4:
             pos = pos[pos["name"] == sel_local]
         pos_view = pos.rename(columns={"name":"투자자","symbol":"종목","ccy":"통화","qty":"보유 주식수","avg_px":"평균매수가","cost_basis":"총원가"}) if not pos.empty else pd.DataFrame(columns=["투자자","종목","통화","보유 주식수","평균매수가","총원가"])
 
-    all_pos = pos if sel_local != "(전체)" else investor_positions()
-    all_view = all_pos.rename(columns={"symbol":"종목","ccy":"통화","cost_basis":"총원가"}) if not all_pos.empty else pd.DataFrame(columns=["종목","통화","총원가"])
-    if "총원가" not in all_view.columns and not all_view.empty:
-        if "cost_basis" in all_view.columns:
-            all_view = all_view.rename(columns={"cost_basis":"총원가"})
-        else:
-            all_view["총원가"] = 0.0
-
-    tot_by_ccy = all_view.groupby("통화")["총원가"].sum().to_dict() if not all_view.empty else {}
-
     if not pos_view.empty:
         denom_local = pos_view.groupby("통화")["총원가"].sum().to_dict()
         pos_view["보유비중(%)"] = pos_view.apply(lambda r: (float(r["총원가"])/float(denom_local.get(r["통화"], 0.0))*100.0) if float(denom_local.get(r["통화"],0.0))>0 else np.nan, axis=1)
-        pos_view["전체계좌비중(%)"] = pos_view.apply(lambda r: (float(r["총원가"])/float(tot_by_ccy.get(r["통화"], 0.0))*100.0) if float(tot_by_ccy.get(r["통화"],0.0))>0 else np.nan, axis=1)
-        pos_view["괴리(%)"] = pos_view.apply(lambda r: (r["보유비중(%)"] - r["전체계좌비중(%)"]) if (not pd.isna(r["보유비중(%)"]) and not pd.isna(r["전체계좌비중(%)"])) else np.nan, axis=1)
         pos_view["보유 주식수"] = pos_view["보유 주식수"].apply(fmt_qty_2)
         pos_view = apply_row_ccy_format(pos_view, "통화", [], ["평균매수가"], ["총원가"])
-        for c in ["보유비중(%)","전체계좌비중(%)","괴리(%)"]:
+        for c in ["보유비중(%)"]:
             pos_view[c] = pos_view[c].apply(lambda x: "" if pd.isna(x) else f"{float(x):,.2f}")
-        pos_view = pos_view[["투자자","종목","통화","보유 주식수","평균매수가","총원가","보유비중(%)","전체계좌비중(%)","괴리(%)"]]
+        pos_view = pos_view[["투자자","종목","통화","보유 주식수","평균매수가","총원가","보유비중(%)"]]
 
     st.dataframe(
         pos_view,
@@ -1140,10 +1128,41 @@ with T4:
             "평균매수가": st.column_config.TextColumn("평균매수가", width=144),
             "총원가": st.column_config.TextColumn("총원가", width=168),
             "보유비중(%)": st.column_config.TextColumn("보유비중(%)", width=84),
-            "전체계좌비중(%)": st.column_config.TextColumn("전체계좌비중(%)", width=98),
-            "괴리(%)": st.column_config.TextColumn("괴리(%)", width=96),
         }
     )
+
+    if sel_local != "(전체)":
+        iid_row = inv_df[inv_df["name"] == sel_local]
+        if not iid_row.empty:
+            iid = int(iid_row.iloc[0]["id"])
+            io_sum = load_df(
+                """
+                  SELECT ccy AS 통화,
+                         SUM(CASE WHEN type='DEPOSIT' THEN amount ELSE 0 END) AS 입금,
+                         SUM(CASE WHEN type='WITHDRAW' THEN amount ELSE 0 END) AS 출금,
+                         SUM(CASE WHEN type='DEPOSIT' THEN amount WHEN type='WITHDRAW' THEN -amount ELSE 0 END) AS 순입금
+                  FROM cash_flows
+                  WHERE investor_id=?
+                  GROUP BY ccy
+                  ORDER BY ccy
+                """,
+                params=(iid,),
+            )
+            if not io_sum.empty:
+                for col in ["입금", "출금", "순입금"]:
+                    io_sum[col] = io_sum.apply(lambda r: fmt_by_ccy(_to_float_safe(r[col]), r["통화"], "amount"), axis=1)
+                st.markdown("#### 입출금 합계")
+                st.dataframe(
+                    io_sum,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "통화": st.column_config.TextColumn("통화", width=80),
+                        "입금": st.column_config.TextColumn("입금", width=160),
+                        "출금": st.column_config.TextColumn("출금", width=160),
+                        "순입금": st.column_config.TextColumn("순입금", width=160),
+                    },
+                )
 
     st.markdown("#### 잔고(예수금)")
     bal_krw = investor_balances("KRW").rename(columns={"name":"투자자","cash":"KRW 예수금"})[["투자자","KRW 예수금"]]
