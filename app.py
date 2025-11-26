@@ -561,16 +561,34 @@ def investor_positions() -> pd.DataFrame:
 
 def investor_balances(ccy: str = "KRW") -> pd.DataFrame:
     with get_conn() as conn:
-        return pd.read_sql_query("""
+        return pd.read_sql_query(
+            f"""
           SELECT inv.name, inv.id as investor_id,
                  COALESCE(SUM(CASE
                    WHEN cf.type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN') THEN cf.amount
                    WHEN cf.type IN ('WITHDRAW','MGMT_FEE_OUT') THEN -cf.amount ELSE 0 END), 0.0) as cash
           FROM investors inv
-          LEFT JOIN cash_flows cf ON cf.investor_id = inv.id AND cf.ccy = ?
+          LEFT JOIN cash_flows cf ON cf.investor_id = inv.id AND cf.ccy = ?{extra_where}
           GROUP BY inv.id, inv.name
           ORDER BY inv.name
-        """, conn, params=(ccy,))
+        """,
+            conn,
+            params=params,
+        )
+
+
+def total_cash_snapshot() -> Dict[str, float]:
+    """Return latest cash totals per 통화 directly from DB to align dashboard with 원장."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+          SELECT cf.ccy,
+                 COALESCE(SUM(CASE
+                   WHEN cf.type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN') THEN cf.amount
+                   WHEN cf.type IN ('WITHDRAW','MGMT_FEE_OUT') THEN -cf.amount ELSE 0 END), 0.0) as cash
+          FROM cash_flows cf
+          GROUP BY cf.ccy
+        """).fetchall()
+    return {r[0]: float(r[1] or 0.0) for r in rows}
 
 
 def total_cash_snapshot() -> Dict[str, float]:
@@ -1167,11 +1185,59 @@ with T4:
     st.markdown("#### 잔고(예수금)")
     bal_krw = investor_balances("KRW").rename(columns={"name":"투자자","cash":"KRW 예수금"})[["투자자","KRW 예수금"]]
     bal_usd = investor_balances("USD").rename(columns={"name":"투자자","cash":"USD 예수금"})[["투자자","USD 예수금"]]
+    dep_krw = load_df(
+        """
+          SELECT inv.name AS 투자자, SUM(cf.amount) AS "총입금(KRW)"
+          FROM cash_flows cf
+          JOIN investors inv ON inv.id = cf.investor_id
+          WHERE cf.type='DEPOSIT' AND cf.ccy='KRW'
+          GROUP BY cf.investor_id
+        """
+    )
     bal = pd.merge(bal_krw, bal_usd, on="투자자", how="outer").fillna(0)
+    if not dep_krw.empty:
+        dep_krw["총입금(KRW)"] = dep_krw["총입금(KRW)"].apply(_to_float_safe)
+        bal = bal.merge(dep_krw[["투자자", "총입금(KRW)"]], on="투자자", how="left")
     if not bal.empty:
-        bal["KRW 예수금"] = bal["KRW 예수금"].map(lambda x: fmt_by_ccy(x, "KRW", "amount"))
-        bal["USD 예수금"] = bal["USD 예수금"].map(lambda x: fmt_by_ccy(x, "USD", "amount"))
+        for col, ccy in [("KRW 예수금", "KRW"), ("USD 예수금", "USD")]:
+            if col in bal.columns:
+                bal[col] = bal[col].fillna(0).map(lambda x: fmt_by_ccy(x, ccy, "amount"))
+        if "총입금(KRW)" in bal.columns:
+            bal["총입금(KRW)"] = bal["총입금(KRW)"].fillna(0).map(lambda x: fmt_by_ccy(x, "KRW", "amount"))
     st.dataframe(bal, use_container_width=True)
+
+    st.markdown("#### 일자별 예수금")
+    as_of_col, _ = st.columns([1, 3])
+    with as_of_col:
+        as_of_date = st.date_input("예수금 기준일", value=date.today(), key="bal_as_of_date")
+
+    bal_krw_asof = investor_balances("KRW", as_of=as_of_date).rename(columns={"name": "투자자", "cash": "KRW 예수금"})
+    bal_usd_asof = investor_balances("USD", as_of=as_of_date).rename(columns={"name": "투자자", "cash": "USD 예수금"})
+
+    bal_asof = pd.merge(
+        bal_krw_asof[["투자자", "KRW 예수금"]] if not bal_krw_asof.empty else pd.DataFrame(columns=["투자자", "KRW 예수금"]),
+        bal_usd_asof[["투자자", "USD 예수금"]] if not bal_usd_asof.empty else pd.DataFrame(columns=["투자자", "USD 예수금"]),
+        on="투자자",
+        how="outer",
+    ).fillna(0)
+
+    if sel_local != "(전체)":
+        bal_asof = bal_asof[bal_asof["투자자"] == sel_local]
+
+    if not bal_asof.empty:
+        for col, ccy in [("KRW 예수금", "KRW"), ("USD 예수금", "USD")]:
+            if col in bal_asof.columns:
+                bal_asof[col] = bal_asof[col].fillna(0).map(lambda x: fmt_by_ccy(x, ccy, "amount"))
+    st.dataframe(
+        bal_asof,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "투자자": st.column_config.TextColumn("투자자", width=180),
+            "KRW 예수금": st.column_config.TextColumn("KRW 예수금", width=180),
+            "USD 예수금": st.column_config.TextColumn("USD 예수금", width=180),
+        },
+    )
 
 # ==============================
 # Dividends  (비운용자 0.9, 운용자 = 자기지분 + 총액의 10% 추가)
