@@ -559,12 +559,7 @@ def investor_positions() -> pd.DataFrame:
             })
     return pd.DataFrame(rows, columns=["investor_id","name","symbol","ccy","qty","avg_px","cost_basis"])
 
-def investor_balances(ccy: str = "KRW", as_of: Optional[date] = None) -> pd.DataFrame:
-    extra_where = " AND date(cf.dt) <= date(?)" if as_of else ""
-    params: List = [ccy]
-    if as_of:
-        params.append(as_of.isoformat())
-
+def investor_balances(ccy: str = "KRW") -> pd.DataFrame:
     with get_conn() as conn:
         return pd.read_sql_query(
             f"""
@@ -580,6 +575,20 @@ def investor_balances(ccy: str = "KRW", as_of: Optional[date] = None) -> pd.Data
             conn,
             params=params,
         )
+
+
+def total_cash_snapshot() -> Dict[str, float]:
+    """Return latest cash totals per 통화 directly from DB to align dashboard with 원장."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+          SELECT cf.ccy,
+                 COALESCE(SUM(CASE
+                   WHEN cf.type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN') THEN cf.amount
+                   WHEN cf.type IN ('WITHDRAW','MGMT_FEE_OUT') THEN -cf.amount ELSE 0 END), 0.0) as cash
+          FROM cash_flows cf
+          GROUP BY cf.ccy
+        """).fetchall()
+    return {r[0]: float(r[1] or 0.0) for r in rows}
 
 
 def total_cash_snapshot() -> Dict[str, float]:
@@ -809,7 +818,7 @@ with T3:
             sel_name_ind = st.selectbox("개별 투자자", inv_all_df["name"].tolist(), key="order_ind_name")
 
         # SELL/EDIT 외 모드에서도 체크박스는 노출하되 BUY에서는 안내 처리
-        is_sell_like = (side == "SELL")
+        is_sell_like = (side in ("SELL", "EDIT"))
         if side == "BUY" and st.session_state.get("sell_all", False):
             st.warning("매수 주문이라 이용 불가능합니다.")
             st.session_state["sell_all"] = False
@@ -1173,7 +1182,7 @@ with T4:
                     },
                 )
 
-    st.markdown("#### 잔고")
+    st.markdown("#### 잔고(예수금)")
     bal_krw = investor_balances("KRW").rename(columns={"name":"투자자","cash":"KRW 예수금"})[["투자자","KRW 예수금"]]
     bal_usd = investor_balances("USD").rename(columns={"name":"투자자","cash":"USD 예수금"})[["투자자","USD 예수금"]]
     dep_krw = load_df(
@@ -1693,37 +1702,30 @@ with T8:
             adj_note = st.text_input("조정 비고", value="예수금 조정", key="cash_adj_note")
 
         bal_rows: List[Dict] = []
-        orig_bal_map: Dict[Tuple[int, str], float] = {}
-        key_to_id: Dict[Tuple[str, str], int] = {}
         for ccy in SUPPORTED_CCY:
             cur_bal = investor_balances(ccy)
             if cur_bal.empty:
                 continue
-            cur_bal = cur_bal.rename(columns={"name": "투자자", "cash": "데이터베이스 잔고"})
-            cur_bal["데이터베이스 잔고"] = pd.to_numeric(cur_bal["데이터베이스 잔고"], errors="coerce").fillna(0.0)
+            cur_bal = cur_bal.rename(columns={"name": "투자자", "cash": "현재 예수금"})
             cur_bal["통화"] = ccy
-            for _, r in cur_bal.iterrows():
-                iid = int(r["investor_id"])
-                orig_bal_map[(iid, ccy)] = float(r["데이터베이스 잔고"])
-                key_to_id[(r["투자자"], ccy)] = iid
+            cur_bal["새 예수금"] = cur_bal["현재 예수금"]
             bal_rows.append(cur_bal)
 
-        bal_df = pd.concat(bal_rows, ignore_index=True) if bal_rows else pd.DataFrame(columns=["투자자","investor_id","데이터베이스 잔고","통화"])
+        bal_df = pd.concat(bal_rows, ignore_index=True) if bal_rows else pd.DataFrame(columns=["투자자","investor_id","현재 예수금","통화","새 예수금"])
         if bal_df.empty:
             st.info("표시할 예수금이 없습니다.")
         else:
-            bal_df["데이터베이스 잔고"] = bal_df["데이터베이스 잔고"].apply(_to_float_safe)
-            bal_df["investor_id"] = bal_df["investor_id"].apply(lambda x: int(_to_float_safe(x)))
             edited_bal = st.data_editor(
-                bal_df[["투자자", "통화", "데이터베이스 잔고"]],
+                bal_df[["투자자", "통화", "현재 예수금", "새 예수금", "investor_id"]],
                 key="cash_balance_editor",
                 hide_index=True,
                 use_container_width=True,
-                disabled=["투자자", "통화"],
+                disabled=["투자자", "통화", "현재 예수금", "investor_id"],
                 column_config={
                     "투자자": st.column_config.TextColumn("투자자", width=180),
                     "통화": st.column_config.TextColumn("통화", width=80),
-                    "데이터베이스 잔고": st.column_config.NumberColumn("데이터베이스 잔고", format="%.10g"),
+                    "현재 예수금": st.column_config.NumberColumn("현재 예수금", format=",.2f"),
+                    "새 예수금": st.column_config.NumberColumn("새 예수금", format=",.2f"),
                 },
             )
 
@@ -1731,15 +1733,13 @@ with T8:
                 changes = []
                 if isinstance(edited_bal, pd.DataFrame):
                     for _, r in edited_bal.iterrows():
-                        inv_name = str(r.get("투자자"))
-                        ccy = str(r.get("통화"))
-                        iid = key_to_id.get((inv_name, ccy))
-                        if iid is None: continue
-                        cur_amt = orig_bal_map.get((iid, ccy), 0.0)
-                        new_amt = _to_float_safe(r.get("데이터베이스 잔고", 0.0))
+                        new_amt = _to_float_safe(r.get("새 예수금", 0.0))
+                        cur_amt = _to_float_safe(r.get("현재 예수금", 0.0))
                         delta = truncate_amount(new_amt - cur_amt, str(r.get("통화")))
                         if abs(delta) <= 1e-9:
                             continue
+                        iid = int(r.get("investor_id"))
+                        ccy = str(r.get("통화"))
                         cf_type = "DEPOSIT" if delta > 0 else "WITHDRAW"
                         add_cashflow_retry(
                             investor_id=iid,
