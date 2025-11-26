@@ -566,8 +566,7 @@ def investor_balances(ccy: str = "KRW", as_of: Optional[date] = None) -> pd.Data
         params.append(as_of.isoformat())
 
     with get_conn() as conn:
-        return pd.read_sql_query(
-            f"""
+        query = """
           SELECT inv.name, inv.id as investor_id,
                  COALESCE(SUM(CASE
                    WHEN cf.type IN ('DEPOSIT','DIVIDEND','MGMT_FEE_IN') THEN cf.amount
@@ -576,10 +575,8 @@ def investor_balances(ccy: str = "KRW", as_of: Optional[date] = None) -> pd.Data
           LEFT JOIN cash_flows cf ON cf.investor_id = inv.id AND cf.ccy = ?{extra_where}
           GROUP BY inv.id, inv.name
           ORDER BY inv.name
-        """,
-            conn,
-            params=params,
-        )
+        """.format(extra_where=extra_where)
+        return pd.read_sql_query(query, conn, params=params)
 
 
 def total_cash_snapshot() -> Dict[str, float]:
